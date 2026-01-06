@@ -44,40 +44,56 @@ class Asset:
     """
     A registered asset in the Art DAG.
 
+    The content_hash is the true identifier. URL and local_path are
+    locations where the content can be fetched.
+
     Attributes:
         name: Unique name for the asset
-        path: Path to the source file
-        content_hash: SHA256 hash of file content (first 16 chars)
+        content_hash: SHA-3-256 hash - the canonical identifier
+        url: Public URL (canonical location)
+        local_path: Optional local path (for local execution)
         asset_type: Type of asset (image, video, audio, etc.)
         tags: List of tags for categorization
         metadata: Additional metadata (dimensions, duration, etc.)
         created_at: Timestamp when added to registry
     """
     name: str
-    path: Path
     content_hash: str
+    url: Optional[str] = None
+    local_path: Optional[Path] = None
     asset_type: str = "unknown"
     tags: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
 
+    @property
+    def path(self) -> Optional[Path]:
+        """Backwards compatible path property."""
+        return self.local_path
+
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "name": self.name,
-            "path": str(self.path),
             "content_hash": self.content_hash,
             "asset_type": self.asset_type,
             "tags": self.tags,
             "metadata": self.metadata,
             "created_at": self.created_at,
         }
+        if self.url:
+            data["url"] = self.url
+        if self.local_path:
+            data["local_path"] = str(self.local_path)
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Asset":
+        local_path = data.get("local_path") or data.get("path")  # backwards compat
         return cls(
             name=data["name"],
-            path=Path(data["path"]),
             content_hash=data["content_hash"],
+            url=data.get("url"),
+            local_path=Path(local_path) if local_path else None,
             asset_type=data.get("asset_type", "unknown"),
             tags=data.get("tags", []),
             metadata=data.get("metadata", {}),
@@ -142,7 +158,9 @@ class Registry:
     def add(
         self,
         name: str,
-        path: Path | str,
+        content_hash: str,
+        url: str = None,
+        local_path: Path | str = None,
         asset_type: str = None,
         tags: List[str] = None,
         metadata: Dict[str, Any] = None,
@@ -152,7 +170,66 @@ class Registry:
 
         Args:
             name: Unique name for the asset
+            content_hash: SHA-3-256 hash of the content (the canonical identifier)
+            url: Public URL where the asset can be fetched
+            local_path: Optional local path (for local execution)
+            asset_type: Type of asset (image, video, audio, etc.)
+            tags: List of tags for categorization
+            metadata: Additional metadata
+
+        Returns:
+            The created Asset
+        """
+        # Auto-detect asset type from URL or path extension
+        if asset_type is None:
+            ext = None
+            if url:
+                ext = Path(url.split("?")[0]).suffix.lower()
+            elif local_path:
+                ext = Path(local_path).suffix.lower()
+            if ext:
+                type_map = {
+                    ".jpg": "image", ".jpeg": "image", ".png": "image",
+                    ".gif": "image", ".webp": "image", ".bmp": "image",
+                    ".mp4": "video", ".mkv": "video", ".avi": "video",
+                    ".mov": "video", ".webm": "video",
+                    ".mp3": "audio", ".wav": "audio", ".flac": "audio",
+                    ".ogg": "audio", ".aac": "audio",
+                }
+                asset_type = type_map.get(ext, "unknown")
+            else:
+                asset_type = "unknown"
+
+        asset = Asset(
+            name=name,
+            content_hash=content_hash,
+            url=url,
+            local_path=Path(local_path).resolve() if local_path else None,
+            asset_type=asset_type,
+            tags=tags or [],
+            metadata=metadata or {},
+        )
+
+        self._assets[name] = asset
+        self._save()
+        return asset
+
+    def add_from_file(
+        self,
+        name: str,
+        path: Path | str,
+        url: str = None,
+        asset_type: str = None,
+        tags: List[str] = None,
+        metadata: Dict[str, Any] = None,
+    ) -> Asset:
+        """
+        Add an asset from a local file (computes hash automatically).
+
+        Args:
+            name: Unique name for the asset
             path: Path to the source file
+            url: Optional public URL
             asset_type: Type of asset (auto-detected if not provided)
             tags: List of tags for categorization
             metadata: Additional metadata
@@ -164,44 +241,17 @@ class Registry:
         if not path.exists():
             raise FileNotFoundError(f"Asset file not found: {path}")
 
-        # Compute content hash
         content_hash = _file_hash(path)
 
-        # Auto-detect asset type from extension
-        if asset_type is None:
-            ext = path.suffix.lower()
-            type_map = {
-                ".jpg": "image", ".jpeg": "image", ".png": "image",
-                ".gif": "image", ".webp": "image", ".bmp": "image",
-                ".mp4": "video", ".mkv": "video", ".avi": "video",
-                ".mov": "video", ".webm": "video",
-                ".mp3": "audio", ".wav": "audio", ".flac": "audio",
-                ".ogg": "audio", ".aac": "audio",
-            }
-            asset_type = type_map.get(ext, "unknown")
-
-        # Copy asset if configured
-        if self.copy_assets:
-            assets_dir = self._assets_dir()
-            asset_dir = assets_dir / content_hash
-            asset_dir.mkdir(parents=True, exist_ok=True)
-            dest_path = asset_dir / path.name
-            if not dest_path.exists():
-                shutil.copy2(path, dest_path)
-            path = dest_path
-
-        asset = Asset(
+        return self.add(
             name=name,
-            path=path.resolve(),
             content_hash=content_hash,
+            url=url,
+            local_path=path,
             asset_type=asset_type,
-            tags=tags or [],
-            metadata=metadata or {},
+            tags=tags,
+            metadata=metadata,
         )
-
-        self._assets[name] = asset
-        self._save()
-        return asset
 
     def get(self, name: str) -> Optional[Asset]:
         """Get an asset by name."""

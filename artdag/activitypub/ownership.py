@@ -66,7 +66,9 @@ class OwnershipManager:
         self,
         actor: Actor,
         name: str,
-        path: Path | str,
+        content_hash: str,
+        url: str = None,
+        local_path: Path | str = None,
         tags: List[str] = None,
         metadata: Dict[str, Any] = None,
     ) -> tuple[Asset, Activity]:
@@ -79,7 +81,9 @@ class OwnershipManager:
         Args:
             actor: The actor claiming ownership
             name: Name for the asset
-            path: Path to the asset file
+            content_hash: SHA-3-256 hash of the content
+            url: Public URL (canonical location)
+            local_path: Optional local path
             tags: Optional tags
             metadata: Optional metadata
 
@@ -89,7 +93,9 @@ class OwnershipManager:
         # Add to registry
         asset = self.registry.add(
             name=name,
-            path=path,
+            content_hash=content_hash,
+            url=url,
+            local_path=local_path,
             tags=tags,
             metadata=metadata,
         )
