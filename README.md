@@ -59,17 +59,24 @@ artdag/
 ├── cache.py         # Content-addressed file cache
 ├── executor.py      # Base executor + registry
 ├── engine.py        # DAG execution engine
-├── registry/        # Asset registry
 ├── activitypub/     # Identity + ownership
 │   ├── actor.py     # Actor identity with RSA keys
 │   ├── activity.py  # Create, Announce activities
 │   ├── signatures.py # RSA signing/verification
 │   └── ownership.py # Links actors to assets
-└── nodes/           # Built-in executors
-    ├── source.py    # SOURCE
-    ├── transform.py # SEGMENT, RESIZE, TRANSFORM
-    └── compose.py   # SEQUENCE, LAYER, MUX, BLEND
+├── nodes/           # Built-in executors
+│   ├── source.py    # SOURCE
+│   ├── transform.py # SEGMENT, RESIZE, TRANSFORM
+│   ├── compose.py   # SEQUENCE, LAYER, MUX, BLEND
+│   └── effect.py    # EFFECT (identity, etc.)
+└── effects/         # Effect implementations
+    └── identity/    # The foundational identity effect
 ```
+
+## Related Repos
+
+- **Registry**: https://git.rose-ash.com/art-dag/registry - Asset registry with ownership proofs
+- **Recipes**: https://git.rose-ash.com/art-dag/recipes - DAG recipes using effects
 
 ## License
 
