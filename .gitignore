@@ -36,9 +36,5 @@ htmlcov/
 env/
 venv/
 
-# Registry data (local testing)
-artdag/registry/art_dag/
-
-# Cache
-*.cache/
+# Private keys (ActivityPub secrets)
 .cache/
