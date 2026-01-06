@@ -41,3 +41,4 @@ artdag/registry/art_dag/
 
 # Cache
 *.cache/
+.cache/

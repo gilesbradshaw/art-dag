@@ -1,0 +1,17 @@
+{
+  "@context": [
+    "https://www.w3.org/ns/activitystreams",
+    "https://w3id.org/security/v1"
+  ],
+  "type": "Person",
+  "id": "https://artdag.rose-ash.com/users/giles",
+  "preferredUsername": "giles",
+  "name": "Giles Bradshaw",
+  "inbox": "https://artdag.rose-ash.com/users/giles/inbox",
+  "outbox": "https://artdag.rose-ash.com/users/giles/outbox",
+  "publicKey": {
+    "id": "https://artdag.rose-ash.com/users/giles#main-key",
+    "owner": "https://artdag.rose-ash.com/users/giles",
+    "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArB+MkIXra0bsEvphvWPD\neW5wzsy3NV8XqLvY67WOpe2uV/xkao3gmQIlOnKUjK92KqWhv01kq2MrMRLhsmWR\nq1aCfqn62CYmvv6fWNrCEPRDTzmXR+mULg+YYSIphO93wvus5z5K8sjv33Ewh6Lu\nIYCUFgyl+ynbwop3KONCJj9xFJFVXtS89uwjnDC2TvPtqRlIibzZa0dgr4Ih14HL\n84KMvB6Ax3kNOdkxzbkSZQOSFQU8VNSrEkg3BD2+8odN4jx0vGx7xx5kbAazibfy\nb7LRPxobCzwIWDLTKB9OpvTlZYxYkZNKdLfVPi2oc9OAGLdcUxAhy1DOQxCG6TfP\nFQIDAQAB\n-----END PUBLIC KEY-----\n"
+  }
+}

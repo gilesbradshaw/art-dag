@@ -1,0 +1,2 @@
+# Identity effect has no dependencies
+# It's a pure function: identity(x) = x

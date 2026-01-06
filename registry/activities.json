@@ -1,0 +1,27 @@
+{
+  "version": "1.0",
+  "activities": [
+    {
+      "activity_id": "b75109e8-5aec-4ed6-a398-c3f04d7d9362",
+      "activity_type": "Create",
+      "actor_id": "https://artdag.rose-ash.com/users/giles",
+      "object_data": {
+        "type": "Document",
+        "name": "effect:identity",
+        "id": "https://artdag.rose-ash.com/objects/640ea11ee881ebf4101af0a955439105ab11e763682b209e88ea08fc66e1cc03",
+        "contentHash": {
+          "algorithm": "sha3-256",
+          "value": "640ea11ee881ebf4101af0a955439105ab11e763682b209e88ea08fc66e1cc03"
+        },
+        "attributedTo": "https://artdag.rose-ash.com/users/giles"
+      },
+      "published": "2026-01-06T23:01:27Z",
+      "signature": {
+        "type": "RsaSignature2017",
+        "creator": "https://artdag.rose-ash.com/users/giles#main-key",
+        "created": "2026-01-06T23:01:27Z",
+        "signatureValue": "j9JPE30T7QN9H38b2PfPLCCSxcBmY05Yf4v98dH0s+Y1Bxe3y1Nv8GbadSFCwgkH/v6WN9AkMgInN3sk+nXrrewv8YMhn/D1HZw0Iym3JHOAiboki+T1t47kq+IIWJYTxkwbOePlMzRMoBrg35ZNOXU8cM8gk0UTamMyLrJ7rfNfhvYyhjhTQU77Bfcu/ywMgQZBeZx+pmObP1gM4Mw5yi4z4cjKJnGPSEbMZQonDX0+ThD5Z04d66+YN6TYZp3SpK+i2CXDJf1XX1G0+VfMqs+yTuEJ0MUGiPuei7Fau2HKW92MhGEFQXRy2X7ihhshrZidsOwHc4TTesfOI9Vz9w=="
+      }
+    }
+  ]
+}
