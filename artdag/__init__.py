@@ -11,10 +11,11 @@
 # - Engine: Executes DAGs by resolving dependencies and running executors
 
 from .dag import Node, DAG, DAGBuilder, NodeType
-from .cache import Cache
+from .cache import Cache, CacheEntry
 from .executor import Executor, register_executor, get_executor
 from .engine import Engine
 from .registry import Registry, Asset
+from .activities import Activity, ActivityStore, ActivityManager, make_is_shared_fn
 
 __all__ = [
     "Node",
@@ -22,12 +23,17 @@ __all__ = [
     "DAGBuilder",
     "NodeType",
     "Cache",
+    "CacheEntry",
     "Executor",
     "register_executor",
     "get_executor",
     "Engine",
     "Registry",
     "Asset",
+    "Activity",
+    "ActivityStore",
+    "ActivityManager",
+    "make_is_shared_fn",
 ]
 
 __version__ = "0.1.0"

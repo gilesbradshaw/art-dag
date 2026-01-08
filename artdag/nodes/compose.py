@@ -370,3 +370,71 @@ class BlendExecutor(Executor):
             raise RuntimeError(f"Blend failed: {result.stderr}")
 
         return output_path
+
+
+@register_executor(NodeType.AUDIO_MIX)
+class AudioMixExecutor(Executor):
+    """
+    Mix multiple audio streams.
+
+    Config:
+        gains: List of gain values per input (0.0-2.0, default 1.0)
+        normalize: Normalize output to prevent clipping (default True)
+    """
+
+    def execute(
+        self,
+        config: Dict[str, Any],
+        inputs: List[Path],
+        output_path: Path,
+    ) -> Path:
+        if len(inputs) < 2:
+            raise ValueError("AUDIO_MIX requires at least 2 inputs")
+
+        gains = config.get("gains", [1.0] * len(inputs))
+        normalize = config.get("normalize", True)
+
+        # Pad gains list if too short
+        while len(gains) < len(inputs):
+            gains.append(1.0)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build filter: apply volume to each input, then mix
+        filter_parts = []
+        mix_inputs = []
+
+        for i, gain in enumerate(gains[:len(inputs)]):
+            if gain != 1.0:
+                filter_parts.append(f"[{i}:a]volume={gain}[a{i}]")
+                mix_inputs.append(f"[a{i}]")
+            else:
+                mix_inputs.append(f"[{i}:a]")
+
+        # amix filter
+        normalize_flag = 1 if normalize else 0
+        mix_filter = f"{''.join(mix_inputs)}amix=inputs={len(inputs)}:normalize={normalize_flag}[aout]"
+        filter_parts.append(mix_filter)
+
+        filter_complex = ";".join(filter_parts)
+
+        cmd = [
+            "ffmpeg", "-y",
+        ]
+        for p in inputs:
+            cmd.extend(["-i", str(p)])
+
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", "[aout]",
+            "-c:a", "aac",
+            str(output_path)
+        ])
+
+        logger.debug(f"AUDIO_MIX: {len(inputs)} inputs, gains={gains[:len(inputs)]}")
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Audio mix failed: {result.stderr}")
+
+        return output_path

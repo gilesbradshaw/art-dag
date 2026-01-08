@@ -277,6 +277,97 @@ class TestMuxExecutor:
         assert result.output_path.exists()
 
 
+class TestAudioMixExecutor:
+    """Test AUDIO_MIX node executor."""
+
+    def test_audio_mix_simple(self, engine, cache_dir):
+        """Test simple audio mixing."""
+        # Create two test audio files with different frequencies
+        audio1_path = cache_dir / "audio1.mp3"
+        audio2_path = cache_dir / "audio2.mp3"
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+            "-c:a", "libmp3lame",
+            str(audio1_path)
+        ], capture_output=True, check=True)
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=880:duration=3",
+            "-c:a", "libmp3lame",
+            str(audio2_path)
+        ], capture_output=True, check=True)
+
+        builder = DAGBuilder()
+        a1 = builder.source(str(audio1_path))
+        a2 = builder.source(str(audio2_path))
+        mixed = builder.audio_mix([a1, a2])
+        builder.set_output(mixed)
+        dag = builder.build()
+
+        result = engine.execute(dag)
+
+        assert result.success
+        assert result.output_path.exists()
+
+    def test_audio_mix_with_gains(self, engine, cache_dir):
+        """Test audio mixing with custom gains."""
+        audio1_path = cache_dir / "audio1.mp3"
+        audio2_path = cache_dir / "audio2.mp3"
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=3",
+            "-c:a", "libmp3lame",
+            str(audio1_path)
+        ], capture_output=True, check=True)
+
+        subprocess.run([
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", "sine=frequency=880:duration=3",
+            "-c:a", "libmp3lame",
+            str(audio2_path)
+        ], capture_output=True, check=True)
+
+        builder = DAGBuilder()
+        a1 = builder.source(str(audio1_path))
+        a2 = builder.source(str(audio2_path))
+        mixed = builder.audio_mix([a1, a2], gains=[1.0, 0.3])
+        builder.set_output(mixed)
+        dag = builder.build()
+
+        result = engine.execute(dag)
+
+        assert result.success
+        assert result.output_path.exists()
+
+    def test_audio_mix_three_inputs(self, engine, cache_dir):
+        """Test mixing three audio sources."""
+        audio_paths = []
+        for i, freq in enumerate([440, 660, 880]):
+            path = cache_dir / f"audio{i}.mp3"
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-f", "lavfi", "-i", f"sine=frequency={freq}:duration=2",
+                "-c:a", "libmp3lame",
+                str(path)
+            ], capture_output=True, check=True)
+            audio_paths.append(path)
+
+        builder = DAGBuilder()
+        sources = [builder.source(str(p)) for p in audio_paths]
+        mixed = builder.audio_mix(sources, gains=[1.0, 0.5, 0.3])
+        builder.set_output(mixed)
+        dag = builder.build()
+
+        result = engine.execute(dag)
+
+        assert result.success
+        assert result.output_path.exists()
+
+
 class TestCaching:
     """Test engine caching behavior."""
 

@@ -28,6 +28,7 @@ class NodeType(Enum):
     LAYER = auto()       # Stack spatially (overlay)
     MUX = auto()         # Combine video + audio streams
     BLEND = auto()       # Blend two inputs
+    AUDIO_MIX = auto()   # Mix multiple audio streams
     SWITCH = auto()      # Time-based input switching
 
     # Analysis operations
@@ -319,6 +320,14 @@ class DAGBuilder:
             [input1_id, input2_id],
             name=name
         )
+
+    def audio_mix(self, input_ids: List[str], gains: List[float] = None,
+                  normalize: bool = True, name: str = None) -> str:
+        """Add an AUDIO_MIX node to mix multiple audio streams."""
+        config = {"normalize": normalize}
+        if gains is not None:
+            config["gains"] = gains
+        return self._add(NodeType.AUDIO_MIX, config, input_ids, name=name)
 
     # Output
 

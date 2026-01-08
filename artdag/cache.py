@@ -17,6 +17,20 @@ from typing import Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _file_hash(path: Path, algorithm: str = "sha3_256") -> str:
+    """
+    Compute content hash of a file.
+
+    Uses SHA-3 (Keccak) by default for quantum resistance.
+    """
+    import hashlib
+    hasher = hashlib.new(algorithm)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 @dataclass
 class CacheEntry:
     """Metadata about a cached output."""
@@ -25,6 +39,7 @@ class CacheEntry:
     created_at: float
     size_bytes: int
     node_type: str
+    content_hash: str = ""  # SHA-3 hash of file content
     execution_time: float = 0.0
 
     def to_dict(self) -> Dict:
@@ -34,6 +49,7 @@ class CacheEntry:
             "created_at": self.created_at,
             "size_bytes": self.size_bytes,
             "node_type": self.node_type,
+            "content_hash": self.content_hash,
             "execution_time": self.execution_time,
         }
 
@@ -45,6 +61,7 @@ class CacheEntry:
             created_at=data["created_at"],
             size_bytes=data["size_bytes"],
             node_type=data["node_type"],
+            content_hash=data.get("content_hash", ""),
             execution_time=data.get("execution_time", 0.0),
         )
 
@@ -179,6 +196,9 @@ class Cache:
             else:
                 shutil.copy2(source_path, output_path)
 
+        # Compute content hash
+        content_hash = _file_hash(output_path)
+
         # Create entry
         entry = CacheEntry(
             node_id=node_id,
@@ -186,6 +206,7 @@ class Cache:
             created_at=time.time(),
             size_bytes=output_path.stat().st_size,
             node_type=node_type,
+            content_hash=content_hash,
             execution_time=execution_time,
         )
 
@@ -237,6 +258,17 @@ class Cache:
     def list_entries(self) -> List[CacheEntry]:
         """List all cache entries."""
         return list(self._entries.values())
+
+    def get_entry(self, node_id: str) -> Optional[CacheEntry]:
+        """Get cache entry metadata (without affecting stats)."""
+        return self._entries.get(node_id)
+
+    def find_by_content_hash(self, content_hash: str) -> Optional[CacheEntry]:
+        """Find a cache entry by its content hash."""
+        for entry in self._entries.values():
+            if entry.content_hash == content_hash:
+                return entry
+        return None
 
     def prune(self, max_size_bytes: int = None, max_age_seconds: float = None) -> int:
         """
