@@ -151,6 +151,19 @@ class Cache:
         """
         entry = self._entries.get(node_id)
         if entry is None:
+            # Entry not in memory - check filesystem directly
+            # (handles case where file was added by another process)
+            node_dir = self._node_dir(node_id)
+            if node_dir.exists() and node_dir.is_dir():
+                # Look for output file
+                for f in node_dir.iterdir():
+                    if f.is_file() and f.name != "metadata.json":
+                        # Found it - load metadata and add to entries
+                        self._load_entry_from_disk(node_id)
+                        entry = self._entries.get(node_id)
+                        if entry:
+                            self.stats.record_hit()
+                            return entry.output_path
             self.stats.record_miss()
             return None
 
@@ -164,6 +177,20 @@ class Cache:
         self.stats.record_hit()
         logger.debug(f"Cache hit: {node_id}")
         return entry.output_path
+
+    def _load_entry_from_disk(self, node_id: str):
+        """Load a single entry from disk into memory."""
+        node_dir = self._node_dir(node_id)
+        metadata_path = node_dir / "metadata.json"
+        if metadata_path.exists():
+            try:
+                with open(metadata_path) as f:
+                    data = json.load(f)
+                entry = CacheEntry.from_dict(data)
+                self._entries[node_id] = entry
+                logger.debug(f"Loaded cache entry from disk: {node_id}")
+            except (json.JSONDecodeError, KeyError) as e:
+                logger.warning(f"Failed to load cache entry {node_id}: {e}")
 
     def put(self, node_id: str, source_path: Path, node_type: str,
             execution_time: float = 0.0, move: bool = False) -> Path:
