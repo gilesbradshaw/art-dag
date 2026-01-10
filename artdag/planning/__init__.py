@@ -5,7 +5,14 @@
 # 2. PLAN - Generate execution plan with cache IDs
 # 3. EXECUTE - Run steps with caching
 
-from .schema import ExecutionStep, ExecutionPlan, StepStatus
+from .schema import (
+    ExecutionStep,
+    ExecutionPlan,
+    StepStatus,
+    StepOutput,
+    StepInput,
+    PlanInput,
+)
 from .planner import RecipePlanner, Recipe
 from .tree_reduction import TreeReducer
 
@@ -13,6 +20,9 @@ __all__ = [
     "ExecutionStep",
     "ExecutionPlan",
     "StepStatus",
+    "StepOutput",
+    "StepInput",
+    "PlanInput",
     "RecipePlanner",
     "Recipe",
     "TreeReducer",
