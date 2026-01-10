@@ -71,24 +71,33 @@ class SequenceExecutor(Executor):
         """Simple concatenation with no transition."""
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        concat_file = output_path.parent / f"_concat_{output_path.stem}.txt"
-        with open(concat_file, "w") as f:
-            for path in inputs:
-                abs_path = Path(path).resolve()
-                f.write(f"file '{abs_path}'\n")
+        # Use filter_complex concat to properly handle different input formats
+        # This re-encodes but ensures audio/video sync
+        n = len(inputs)
+        input_args = []
+        for p in inputs:
+            input_args.extend(["-i", str(p)])
+
+        # Build concat filter that handles both video and audio
+        filter_complex = f"concat=n={n}:v=1:a=1[outv][outa]"
+
+        # Build stream labels for each input
+        stream_labels = "".join(f"[{i}:v][{i}:a]" for i in range(n))
+        filter_complex = f"{stream_labels}{filter_complex}"
 
         cmd = [
             "ffmpeg", "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(concat_file),
-            "-c", "copy",
+            *input_args,
+            "-filter_complex", filter_complex,
+            "-map", "[outv]",
+            "-map", "[outa]",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+            "-c:a", "aac", "-b:a", "192k",
             str(output_path)
         ]
 
-        logger.debug(f"SEQUENCE cut: {len(inputs)} clips")
+        logger.debug(f"SEQUENCE cut: {len(inputs)} clips (re-encoding)")
         result = subprocess.run(cmd, capture_output=True, text=True)
-        concat_file.unlink()
 
         if result.returncode != 0:
             raise RuntimeError(f"Concat failed: {result.stderr}")
