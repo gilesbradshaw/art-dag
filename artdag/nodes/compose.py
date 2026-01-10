@@ -30,6 +30,41 @@ def _get_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 
+def _get_video_info(path: Path) -> dict:
+    """Get video width, height, frame rate, and sample rate."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate",
+        "-of", "csv=p=0",
+        str(path)
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    parts = result.stdout.strip().split(",")
+    width = int(parts[0]) if len(parts) > 0 and parts[0] else 1920
+    height = int(parts[1]) if len(parts) > 1 and parts[1] else 1080
+    fps_str = parts[2] if len(parts) > 2 else "30/1"
+    # Parse frame rate (e.g., "30/1" or "30000/1001")
+    if "/" in fps_str:
+        num, den = fps_str.split("/")
+        fps = float(num) / float(den) if float(den) != 0 else 30
+    else:
+        fps = float(fps_str) if fps_str else 30
+
+    # Get audio sample rate
+    cmd_audio = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=sample_rate",
+        "-of", "csv=p=0",
+        str(path)
+    ]
+    result_audio = subprocess.run(cmd_audio, capture_output=True, text=True)
+    sample_rate = int(result_audio.stdout.strip()) if result_audio.stdout.strip() else 44100
+
+    return {"width": width, "height": height, "fps": fps, "sample_rate": sample_rate}
+
+
 @register_executor(NodeType.SEQUENCE)
 class SequenceExecutor(Executor):
     """
@@ -39,6 +74,14 @@ class SequenceExecutor(Executor):
         transition: Transition config
             type: "cut" | "crossfade" | "fade"
             duration: Transition duration in seconds
+        target_size: How to determine output dimensions when inputs differ
+            "first": Use first input's dimensions (default)
+            "last": Use last input's dimensions
+            "largest": Use largest width and height from all inputs
+            "explicit": Use width/height config values
+        width: Target width (when target_size="explicit")
+        height: Target height (when target_size="explicit")
+        background: Padding color for letterbox/pillarbox (default: "black")
     """
 
     def execute(
@@ -59,8 +102,14 @@ class SequenceExecutor(Executor):
         transition_type = transition.get("type", "cut")
         transition_duration = transition.get("duration", 0.5)
 
+        # Size handling config
+        target_size = config.get("target_size", "first")
+        width = config.get("width")
+        height = config.get("height")
+        background = config.get("background", "black")
+
         if transition_type == "cut":
-            return self._concat_cut(inputs, output_path)
+            return self._concat_cut(inputs, output_path, target_size, width, height, background)
         elif transition_type == "crossfade":
             return self._concat_crossfade(inputs, output_path, transition_duration)
         elif transition_type == "fade":
@@ -68,23 +117,74 @@ class SequenceExecutor(Executor):
         else:
             raise ValueError(f"Unknown transition type: {transition_type}")
 
-    def _concat_cut(self, inputs: List[Path], output_path: Path) -> Path:
-        """Simple concatenation with no transition."""
+    def _concat_cut(
+        self,
+        inputs: List[Path],
+        output_path: Path,
+        target_size: str = "first",
+        width: int = None,
+        height: int = None,
+        background: str = "black",
+    ) -> Path:
+        """
+        Concatenate with scaling/padding to handle different resolutions.
+
+        Args:
+            inputs: Input video paths
+            output_path: Output path
+            target_size: How to determine output size:
+                - "first": Use first input's dimensions (default)
+                - "last": Use last input's dimensions
+                - "largest": Use largest dimensions from all inputs
+                - "explicit": Use width/height params
+            width: Explicit width (when target_size="explicit")
+            height: Explicit height (when target_size="explicit")
+            background: Padding color (default: black)
+        """
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Use filter_complex concat to properly handle different input formats
-        # This re-encodes but ensures audio/video sync
         n = len(inputs)
         input_args = []
         for p in inputs:
             input_args.extend(["-i", str(p)])
 
-        # Build concat filter that handles both video and audio
-        filter_complex = f"concat=n={n}:v=1:a=1[outv][outa]"
+        # Get video info for all inputs
+        infos = [_get_video_info(p) for p in inputs]
 
-        # Build stream labels for each input
-        stream_labels = "".join(f"[{i}:v][{i}:a]" for i in range(n))
-        filter_complex = f"{stream_labels}{filter_complex}"
+        # Determine target dimensions
+        if target_size == "explicit" and width and height:
+            target_w, target_h = width, height
+        elif target_size == "last":
+            target_w, target_h = infos[-1]["width"], infos[-1]["height"]
+        elif target_size == "largest":
+            target_w = max(i["width"] for i in infos)
+            target_h = max(i["height"] for i in infos)
+        else:  # "first" or default
+            target_w, target_h = infos[0]["width"], infos[0]["height"]
+
+        # Use common frame rate (from first input) and sample rate
+        target_fps = infos[0]["fps"]
+        target_sr = max(i["sample_rate"] for i in infos)
+
+        # Build filter for each input: scale to fit + pad to target size
+        filter_parts = []
+        for i in range(n):
+            # Scale to fit within target, maintaining aspect ratio, then pad
+            vf = (
+                f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+                f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color={background},"
+                f"setsar=1,fps={target_fps:.6f}[v{i}]"
+            )
+            # Resample audio to common rate
+            af = f"[{i}:a]aresample={target_sr}[a{i}]"
+            filter_parts.append(vf)
+            filter_parts.append(af)
+
+        # Build concat filter
+        stream_labels = "".join(f"[v{i}][a{i}]" for i in range(n))
+        filter_parts.append(f"{stream_labels}concat=n={n}:v=1:a=1[outv][outa]")
+
+        filter_complex = ";".join(filter_parts)
 
         cmd = [
             "ffmpeg", "-y",
@@ -96,7 +196,7 @@ class SequenceExecutor(Executor):
             str(output_path)
         ]
 
-        logger.debug(f"SEQUENCE cut: {len(inputs)} clips (web-optimized)")
+        logger.debug(f"SEQUENCE cut: {n} clips -> {target_w}x{target_h} (web-optimized)")
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
