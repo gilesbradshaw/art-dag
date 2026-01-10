@@ -17,7 +17,22 @@ from .engine import Engine
 from .registry import Registry, Asset
 from .activities import Activity, ActivityStore, ActivityManager, make_is_shared_fn
 
+# Analysis and planning modules (optional, require extra dependencies)
+try:
+    from .analysis import Analyzer, AnalysisResult
+except ImportError:
+    Analyzer = None
+    AnalysisResult = None
+
+try:
+    from .planning import RecipePlanner, ExecutionPlan, ExecutionStep
+except ImportError:
+    RecipePlanner = None
+    ExecutionPlan = None
+    ExecutionStep = None
+
 __all__ = [
+    # Core
     "Node",
     "DAG",
     "DAGBuilder",
@@ -34,6 +49,13 @@ __all__ = [
     "ActivityStore",
     "ActivityManager",
     "make_is_shared_fn",
+    # Analysis (optional)
+    "Analyzer",
+    "AnalysisResult",
+    # Planning (optional)
+    "RecipePlanner",
+    "ExecutionPlan",
+    "ExecutionStep",
 ]
 
 __version__ = "0.1.0"
