@@ -13,6 +13,7 @@ from typing import Any, Dict, List
 
 from ..dag import NodeType
 from ..executor import Executor, register_executor
+from .encoding import WEB_ENCODING_ARGS_STR, get_web_encoding_args
 
 logger = logging.getLogger(__name__)
 
@@ -91,12 +92,11 @@ class SequenceExecutor(Executor):
             "-filter_complex", filter_complex,
             "-map", "[outv]",
             "-map", "[outa]",
-            "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-            "-c:a", "aac", "-b:a", "192k",
+            *get_web_encoding_args(),
             str(output_path)
         ]
 
-        logger.debug(f"SEQUENCE cut: {len(inputs)} clips (re-encoding)")
+        logger.debug(f"SEQUENCE cut: {len(inputs)} clips (web-optimized)")
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
@@ -142,9 +142,9 @@ class SequenceExecutor(Executor):
 
         filter_complex = ";".join(filter_parts)
 
-        cmd = f'ffmpeg -y {input_args} -filter_complex "{filter_complex}" -map [outv] -map [outa] -c:v libx264 -preset ultrafast -crf 18 -c:a aac {output_path}'
+        cmd = f'ffmpeg -y {input_args} -filter_complex "{filter_complex}" -map [outv] -map [outa] {WEB_ENCODING_ARGS_STR} {output_path}'
 
-        logger.debug(f"SEQUENCE crossfade: {n} clips")
+        logger.debug(f"SEQUENCE crossfade: {n} clips (web-optimized)")
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
         if result.returncode != 0:
@@ -249,9 +249,9 @@ class LayerExecutor(Executor):
 
         filter_complex = ";".join(filter_parts)
 
-        cmd = f'ffmpeg -y {input_args} -filter_complex "{filter_complex}" -map [outv] -map 0:a? -c:v libx264 -preset ultrafast -crf 18 -c:a aac {output_path}'
+        cmd = f'ffmpeg -y {input_args} -filter_complex "{filter_complex}" -map [outv] -map 0:a? {WEB_ENCODING_ARGS_STR} {output_path}'
 
-        logger.debug(f"LAYER: {n} inputs")
+        logger.debug(f"LAYER: {n} inputs (web-optimized)")
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
         if result.returncode != 0:
@@ -366,13 +366,12 @@ class BlendExecutor(Executor):
             "-i", str(inputs[0]),
             "-i", str(inputs[1]),
             "-filter_complex", filter_complex,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
             "-map", "0:a?",
-            "-c:a", "aac",
+            *get_web_encoding_args(),
             str(output_path)
         ]
 
-        logger.debug(f"BLEND: {mode} (opacity={opacity})")
+        logger.debug(f"BLEND: {mode} (opacity={opacity}) (web-optimized)")
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:

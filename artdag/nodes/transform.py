@@ -12,6 +12,7 @@ from typing import Any, Dict, List
 
 from ..dag import NodeType
 from ..executor import Executor, register_executor
+from .encoding import get_web_encoding_args, get_web_video_args
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +51,7 @@ class SegmentExecutor(Executor):
                 cmd.extend(["-ss", str(offset)])
             if duration:
                 cmd.extend(["-t", str(duration)])
-            cmd.extend([
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-                "-c:a", "aac",
-                str(output_path)
-            ])
+            cmd.extend([*get_web_encoding_args(), str(output_path)])
         else:
             # Fast: input-seek at keyframes (may be slightly off)
             cmd = ["ffmpeg", "-y"]
@@ -122,12 +119,12 @@ class ResizeExecutor(Executor):
             "ffmpeg", "-y",
             "-i", str(input_path),
             "-vf", vf,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            *get_web_video_args(),
             "-c:a", "copy",
             str(output_path)
         ]
 
-        logger.debug(f"RESIZE: {width}x{height} ({mode})")
+        logger.debug(f"RESIZE: {width}x{height} ({mode}) (web-optimized)")
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
@@ -216,13 +213,9 @@ class TransformExecutor(Executor):
         if af_parts:
             cmd.extend(["-af", ",".join(af_parts)])
 
-        cmd.extend([
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-            "-c:a", "aac",
-            str(output_path)
-        ])
+        cmd.extend([*get_web_encoding_args(), str(output_path)])
 
-        logger.debug(f"TRANSFORM: {list(effects.keys())}")
+        logger.debug(f"TRANSFORM: {list(effects.keys())} (web-optimized)")
         result = subprocess.run(cmd, capture_output=True, text=True)
 
         if result.returncode != 0:
