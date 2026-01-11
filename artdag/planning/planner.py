@@ -16,9 +16,27 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 
-from .schema import ExecutionPlan, ExecutionStep
+from .schema import ExecutionPlan, ExecutionStep, StepOutput, StepInput, PlanInput
 from .tree_reduction import TreeReducer, reduce_sequence
 from ..analysis import AnalysisResult
+
+
+def _infer_media_type(node_type: str, config: Dict[str, Any] = None) -> str:
+    """Infer media type from node type and config."""
+    config = config or {}
+
+    # Audio operations
+    if node_type in ("AUDIO", "MIX_AUDIO", "EXTRACT_AUDIO"):
+        return "audio/wav"
+    if "audio" in node_type.lower():
+        return "audio/wav"
+
+    # Image operations
+    if node_type in ("FRAME", "THUMBNAIL", "IMAGE"):
+        return "image/png"
+
+    # Default to video
+    return "video/mp4"
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +148,7 @@ class RecipePlanner:
         recipe: Recipe,
         input_hashes: Dict[str, str],
         analysis: Optional[Dict[str, AnalysisResult]] = None,
+        seed: Optional[int] = None,
     ) -> ExecutionPlan:
         """
         Generate an execution plan from a recipe.
@@ -138,6 +157,7 @@ class RecipePlanner:
             recipe: The parsed recipe
             input_hashes: Mapping from input name to content hash
             analysis: Analysis results for inputs (keyed by hash)
+            seed: Random seed for deterministic planning
 
         Returns:
             ExecutionPlan with pre-computed cache IDs
@@ -153,9 +173,27 @@ class RecipePlanner:
         # Resolve registry references
         registry_hashes = self._resolve_registry(recipe.registry)
 
+        # Build PlanInput objects from input_hashes
+        plan_inputs = []
+        for name, content_hash in input_hashes.items():
+            # Try to find matching SOURCE node for media type
+            media_type = "application/octet-stream"
+            for node in recipe.nodes:
+                if node.id == name and node.type == "SOURCE":
+                    media_type = _infer_media_type("SOURCE", node.config)
+                    break
+
+            plan_inputs.append(PlanInput(
+                name=name,
+                cache_id=content_hash,
+                content_hash=content_hash,
+                media_type=media_type,
+            ))
+
         # Generate steps
         steps = []
         step_id_map = {}  # Maps recipe node ID to step ID(s)
+        step_name_map = {}  # Maps recipe node ID to human-readable name
         analysis_cache_ids = {}
 
         for node_id in sorted_ids:
@@ -165,18 +203,29 @@ class RecipePlanner:
             new_steps, output_step_id = self._process_node(
                 node=node,
                 step_id_map=step_id_map,
+                step_name_map=step_name_map,
                 input_hashes=input_hashes,
                 registry_hashes=registry_hashes,
                 analysis=analysis or {},
+                recipe_name=recipe.name,
             )
 
             steps.extend(new_steps)
             step_id_map[node_id] = output_step_id
+            # Track human-readable name for this node
+            if new_steps:
+                step_name_map[node_id] = new_steps[-1].name
 
         # Find output step
         output_step = step_id_map.get(recipe.output)
         if not output_step:
             raise ValueError(f"Output node '{recipe.output}' not found")
+
+        # Determine output name
+        output_name = f"{recipe.name}.output"
+        output_step_obj = next((s for s in steps if s.step_id == output_step), None)
+        if output_step_obj and output_step_obj.outputs:
+            output_name = output_step_obj.outputs[0].name
 
         # Build analysis cache IDs
         if analysis:
@@ -188,10 +237,15 @@ class RecipePlanner:
         # Create plan
         plan = ExecutionPlan(
             plan_id=None,  # Computed in __post_init__
+            name=f"{recipe.name}_plan",
             recipe_id=recipe.name,
+            recipe_name=recipe.name,
             recipe_hash=recipe.recipe_hash,
+            seed=seed,
+            inputs=plan_inputs,
             steps=steps,
             output_step=output_step,
+            output_name=output_name,
             analysis_cache_ids=analysis_cache_ids,
             input_hashes=input_hashes,
             metadata={
@@ -201,12 +255,37 @@ class RecipePlanner:
             },
         )
 
-        # Compute all cache IDs
+        # Compute all cache IDs and then generate outputs
         plan.compute_all_cache_ids()
         plan.compute_levels()
 
+        # Now add outputs to each step (needs cache_id to be computed first)
+        self._add_step_outputs(plan, recipe.name)
+
+        # Recompute plan_id after outputs are added
+        plan.plan_id = plan._compute_plan_id()
+
         logger.info(f"Generated plan with {len(steps)} steps")
         return plan
+
+    def _add_step_outputs(self, plan: ExecutionPlan, recipe_name: str) -> None:
+        """Add output definitions to each step after cache_ids are computed."""
+        for step in plan.steps:
+            if step.outputs:
+                continue  # Already has outputs
+
+            # Generate output name from step name
+            base_name = step.name or step.step_id
+            output_name = f"{recipe_name}.{base_name}.out"
+
+            media_type = _infer_media_type(step.node_type, step.config)
+
+            step.add_output(
+                name=output_name,
+                media_type=media_type,
+                index=0,
+                metadata={},
+            )
 
     def plan_from_yaml(
         self,
@@ -302,9 +381,11 @@ class RecipePlanner:
         self,
         node: RecipeNode,
         step_id_map: Dict[str, str],
+        step_name_map: Dict[str, str],
         input_hashes: Dict[str, str],
         registry_hashes: Dict[str, str],
         analysis: Dict[str, AnalysisResult],
+        recipe_name: str = "",
     ) -> Tuple[List[ExecutionStep], str]:
         """
         Process a recipe node into execution steps.
@@ -312,45 +393,48 @@ class RecipePlanner:
         Args:
             node: Recipe node to process
             step_id_map: Mapping from processed node IDs to step IDs
+            step_name_map: Mapping from node IDs to human-readable names
             input_hashes: User-provided input hashes
             registry_hashes: Registry-resolved hashes
             analysis: Analysis results
+            recipe_name: Name of the recipe (for generating readable names)
 
         Returns:
             Tuple of (new steps, output step ID)
         """
         # SOURCE nodes
         if node.type == "SOURCE":
-            return self._process_source(node, input_hashes, registry_hashes)
+            return self._process_source(node, input_hashes, registry_hashes, recipe_name)
 
         # SOURCE_LIST nodes
         if node.type == "SOURCE_LIST":
-            return self._process_source_list(node, input_hashes)
+            return self._process_source_list(node, input_hashes, recipe_name)
 
         # ANALYZE nodes
         if node.type == "ANALYZE":
-            return self._process_analyze(node, step_id_map, analysis)
+            return self._process_analyze(node, step_id_map, analysis, recipe_name)
 
         # MAP nodes
         if node.type == "MAP":
-            return self._process_map(node, step_id_map, input_hashes, analysis)
+            return self._process_map(node, step_id_map, input_hashes, analysis, recipe_name)
 
         # SEQUENCE nodes (may use tree reduction)
         if node.type == "SEQUENCE":
-            return self._process_sequence(node, step_id_map)
+            return self._process_sequence(node, step_id_map, recipe_name)
 
         # SEGMENT_AT nodes
         if node.type == "SEGMENT_AT":
-            return self._process_segment_at(node, step_id_map, analysis)
+            return self._process_segment_at(node, step_id_map, analysis, recipe_name)
 
         # Standard nodes (SEGMENT, RESIZE, TRANSFORM, LAYER, MUX, BLEND, etc.)
-        return self._process_standard(node, step_id_map)
+        return self._process_standard(node, step_id_map, recipe_name)
 
     def _process_source(
         self,
         node: RecipeNode,
         input_hashes: Dict[str, str],
         registry_hashes: Dict[str, str],
+        recipe_name: str = "",
     ) -> Tuple[List[ExecutionStep], str]:
         """Process SOURCE node."""
         config = dict(node.config)
@@ -370,13 +454,17 @@ class RecipePlanner:
         else:
             raise ValueError(f"SOURCE node '{node.id}' has no input or asset")
 
+        # Human-readable name
+        display_name = config.get("name", node.id)
+        step_name = f"{recipe_name}.inputs.{display_name}" if recipe_name else display_name
+
         step = ExecutionStep(
             step_id=node.id,
             node_type="SOURCE",
             config={"input_ref": node.id, "content_hash": content_hash},
             input_steps=[],
             cache_id=content_hash,  # SOURCE cache_id is just the content hash
-            name=config.get("name", node.id),
+            name=step_name,
         )
 
         return [step], step.step_id
@@ -385,6 +473,7 @@ class RecipePlanner:
         self,
         node: RecipeNode,
         input_hashes: Dict[str, str],
+        recipe_name: str = "",
     ) -> Tuple[List[ExecutionStep], str]:
         """
         Process SOURCE_LIST node.
@@ -403,6 +492,9 @@ class RecipePlanner:
         else:
             items = list(input_value)
 
+        display_name = node.config.get("name", node.id)
+        base_name = f"{recipe_name}.{display_name}" if recipe_name else display_name
+
         steps = []
         for i, content_hash in enumerate(items):
             step = ExecutionStep(
@@ -411,7 +503,7 @@ class RecipePlanner:
                 config={"input_ref": f"{node.id}[{i}]", "content_hash": content_hash},
                 input_steps=[],
                 cache_id=content_hash,
-                name=f"{node.config.get('name', node.id)}[{i}]",
+                name=f"{base_name}[{i}]",
             )
             steps.append(step)
 
@@ -421,7 +513,7 @@ class RecipePlanner:
             node_type="_LIST",
             config={"items": [s.step_id for s in steps]},
             input_steps=[s.step_id for s in steps],
-            name=node.config.get("name", node.id),
+            name=f"{base_name}.list",
         )
         steps.append(list_step)
 
@@ -432,6 +524,7 @@ class RecipePlanner:
         node: RecipeNode,
         step_id_map: Dict[str, str],
         analysis: Dict[str, AnalysisResult],
+        recipe_name: str = "",
     ) -> Tuple[List[ExecutionStep], str]:
         """
         Process ANALYZE node.
@@ -443,6 +536,7 @@ class RecipePlanner:
             raise ValueError(f"ANALYZE node '{node.id}' has no input")
 
         feature = node.config.get("feature", "all")
+        step_name = f"{recipe_name}.analysis.{feature}" if recipe_name else f"analysis.{feature}"
 
         step = ExecutionStep(
             step_id=node.id,
@@ -452,7 +546,7 @@ class RecipePlanner:
                 **node.config,
             },
             input_steps=[input_step],
-            name=f"Analyze {feature}",
+            name=step_name,
         )
 
         return [step], step.step_id
@@ -463,6 +557,7 @@ class RecipePlanner:
         step_id_map: Dict[str, str],
         input_hashes: Dict[str, str],
         analysis: Dict[str, AnalysisResult],
+        recipe_name: str = "",
     ) -> Tuple[List[ExecutionStep], str]:
         """
         Process MAP node - expand iteration over list.
@@ -470,6 +565,7 @@ class RecipePlanner:
         MAP applies an operation to each item in a list.
         """
         operation = node.config.get("operation", "TRANSFORM")
+        base_name = f"{recipe_name}.{node.id}" if recipe_name else node.id
 
         # Get items input
         items_ref = node.config.get("items") or (
@@ -507,7 +603,7 @@ class RecipePlanner:
                         "index": i,
                     },
                     input_steps=[item_step],
-                    name=f"Random slice {i}",
+                    name=f"{base_name}.slice[{i}]",
                 )
             elif operation == "TRANSFORM":
                 step = ExecutionStep(
@@ -515,7 +611,7 @@ class RecipePlanner:
                     node_type="TRANSFORM",
                     config=node.config.get("effects", {}),
                     input_steps=[item_step],
-                    name=f"Transform {i}",
+                    name=f"{base_name}.transform[{i}]",
                 )
             elif operation == "ANALYZE":
                 step = ExecutionStep(
@@ -523,7 +619,7 @@ class RecipePlanner:
                     node_type="ANALYZE",
                     config={"feature": node.config.get("feature", "all")},
                     input_steps=[item_step],
-                    name=f"Analyze {i}",
+                    name=f"{base_name}.analyze[{i}]",
                 )
             else:
                 step = ExecutionStep(
@@ -531,7 +627,7 @@ class RecipePlanner:
                     node_type=operation,
                     config=node.config,
                     input_steps=[item_step],
-                    name=f"{operation} {i}",
+                    name=f"{base_name}.{operation.lower()}[{i}]",
                 )
 
             steps.append(step)
@@ -543,7 +639,7 @@ class RecipePlanner:
             node_type="_LIST",
             config={"items": output_steps},
             input_steps=output_steps,
-            name=f"MAP results",
+            name=f"{base_name}.results",
         )
         steps.append(list_step)
 
@@ -553,12 +649,15 @@ class RecipePlanner:
         self,
         node: RecipeNode,
         step_id_map: Dict[str, str],
+        recipe_name: str = "",
     ) -> Tuple[List[ExecutionStep], str]:
         """
         Process SEQUENCE node.
 
         Uses tree reduction for parallel composition if enabled.
         """
+        base_name = f"{recipe_name}.{node.id}" if recipe_name else node.id
+
         # Resolve input steps
         input_steps = []
         for input_id in node.inputs:
@@ -586,13 +685,13 @@ class RecipePlanner:
             )
 
             steps = []
-            for step_id, inputs, step_config in reduction_steps:
+            for i, (step_id, inputs, step_config) in enumerate(reduction_steps):
                 step = ExecutionStep(
                     step_id=step_id,
                     node_type="SEQUENCE",
                     config=step_config,
                     input_steps=inputs,
-                    name=f"Sequence reduction",
+                    name=f"{base_name}.reduce[{i}]",
                 )
                 steps.append(step)
 
@@ -604,7 +703,7 @@ class RecipePlanner:
                 node_type="SEQUENCE",
                 config=config,
                 input_steps=input_steps,
-                name="Sequence",
+                name=f"{base_name}.concat",
             )
             return [step], step.step_id
 
@@ -613,12 +712,14 @@ class RecipePlanner:
         node: RecipeNode,
         step_id_map: Dict[str, str],
         analysis: Dict[str, AnalysisResult],
+        recipe_name: str = "",
     ) -> Tuple[List[ExecutionStep], str]:
         """
         Process SEGMENT_AT node - cut at specific times.
 
         Creates SEGMENT steps for each time range.
         """
+        base_name = f"{recipe_name}.{node.id}" if recipe_name else node.id
         times_from = node.config.get("times_from")
         distribute = node.config.get("distribute", "round_robin")
 
@@ -629,7 +730,7 @@ class RecipePlanner:
             node_type="SEGMENT_AT",
             config=node.config,
             input_steps=[step_id_map.get(i, i) for i in node.inputs],
-            name="Segment at times",
+            name=f"{base_name}.segment",
         )
 
         return [step], step.step_id
@@ -638,8 +739,10 @@ class RecipePlanner:
         self,
         node: RecipeNode,
         step_id_map: Dict[str, str],
+        recipe_name: str = "",
     ) -> Tuple[List[ExecutionStep], str]:
         """Process standard transformation/composition node."""
+        base_name = f"{recipe_name}.{node.id}" if recipe_name else node.id
         input_steps = [step_id_map.get(i, i) for i in node.inputs]
 
         step = ExecutionStep(
@@ -647,7 +750,7 @@ class RecipePlanner:
             node_type=node.type,
             config=node.config,
             input_steps=input_steps,
-            name=node.type,
+            name=f"{base_name}.{node.type.lower()}",
         )
 
         return [step], step.step_id
