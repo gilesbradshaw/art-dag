@@ -340,13 +340,14 @@ set_cluster_key("my-secret-key")
 
 ## Implementation
 
-The simplified architecture is implemented in `art-celery/tasks/`:
+The simplified architecture is implemented in `art-celery/`:
 
 | File | Purpose |
 |------|---------|
-| `execute_cid.py` | Step execution with CIDs |
-| `analyze_cid.py` | Analysis with CIDs |
-| `orchestrate_cid.py` | Full pipeline orchestration |
+| `hybrid_state.py` | Hybrid state manager (Redis + IPNS) |
+| `tasks/execute_cid.py` | Step execution with CIDs |
+| `tasks/analyze_cid.py` | Analysis with CIDs |
+| `tasks/orchestrate_cid.py` | Full pipeline orchestration |
 
 ### Key Functions
 
@@ -368,14 +369,60 @@ The simplified architecture is implemented in `art-celery/tasks/`:
 - `run_recipe_cid(recipe_cid, input_cids, input_hashes)` → `{output_cid, all_cids}`
 - `run_from_local(recipe_path, input_paths)` → registers + runs
 
+### Hybrid State Manager
+
+For distributed L1 coordination, use the `HybridStateManager` which provides:
+
+**Fast path (local Redis):**
+- `get_cached_cid(cache_id)` / `set_cached_cid(cache_id, cid)` - microsecond lookups
+- `try_claim(cache_id, worker_id)` / `release_claim(cache_id)` - atomic claiming
+- `get_analysis_cid()` / `set_analysis_cid()` - analysis cache
+- `get_plan_cid()` / `set_plan_cid()` - plan cache
+- `get_run_cid()` / `set_run_cid()` - run cache
+
+**Slow path (background IPNS sync):**
+- Periodically syncs local state with global IPNS state (default: every 30s)
+- Pulls new entries from remote nodes
+- Pushes local updates to IPNS
+
+**Configuration:**
+```bash
+# Enable IPNS sync
+export ARTDAG_IPNS_SYNC=true
+export ARTDAG_IPNS_SYNC_INTERVAL=30  # seconds
+```
+
+**Usage:**
+```python
+from hybrid_state import get_state_manager
+
+state = get_state_manager()
+
+# Fast local lookup
+cid = state.get_cached_cid(cache_id)
+
+# Fast local write (synced in background)
+state.set_cached_cid(cache_id, output_cid)
+
+# Atomic claim
+if state.try_claim(cache_id, worker_id):
+    # We have the lock
+    ...
+```
+
+**Trade-offs:**
+- Local Redis: Fast (microseconds), single node
+- IPNS sync: Slow (seconds), eventually consistent across nodes
+- Duplicate work: Accepted (idempotent - same inputs → same CID)
+
 ### Redis Usage (minimal)
 
 | Key | Type | Purpose |
 |-----|------|---------|
 | `artdag:cid_cache` | Hash | cache_id → output CID |
-| `artdag:analysis_cid` | Hash | input_hash:features → analysis CID |
-| `artdag:plan_cid` | Hash | plan_id → plan CID |
-| `artdag:run_cid` | Hash | run_id → output CID |
+| `artdag:analysis_cache` | Hash | input_hash:features → analysis CID |
+| `artdag:plan_cache` | Hash | plan_id → plan CID |
+| `artdag:run_cache` | Hash | run_id → output CID |
 | `artdag:claim:{cache_id}` | String | worker_id (TTL 5 min) |
 
 ## Migration Path
@@ -385,9 +432,10 @@ The simplified architecture is implemented in `art-celery/tasks/`:
    - `execute_cid.py` ✓
    - `analyze_cid.py` ✓
    - `orchestrate_cid.py` ✓
-3. Add `--ipfs-primary` flag to CLI
-4. Gradually deprecate local cache code
-5. Remove old tasks when CID versions are stable
+3. Add `--ipfs-primary` flag to CLI ✓
+4. Add hybrid state manager for L1 coordination ✓
+5. Gradually deprecate local cache code
+6. Remove old tasks when CID versions are stable
 
 ## See Also
 
