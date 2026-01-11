@@ -296,11 +296,25 @@ Or use IPFS pubsub for coordination.
 2. **Initial fetch latency** - First fetch may be slower than local disk
 3. **IPNS latency** - Name resolution can be slow (Option C avoids this)
 
+## Implementation
+
+The simplified architecture is implemented in:
+
+- `art-celery/tasks/execute_cid.py` - CID-based step execution
+
+Key functions:
+- `execute_step_cid(step_json, input_cids)` - Execute single step, return CID
+- `execute_plan_cid(plan_json, input_cids)` - Execute entire plan, return output CID
+
+Redis usage (minimal):
+- `artdag:cid_cache` - Hash: cache_id → CID
+- `artdag:claim:{cache_id}` - String: worker_id (TTL 5 min)
+
 ## Migration Path
 
 1. Keep current system working
 2. Add `--ipfs-primary` flag to CLI
-3. New execute_step that works with CIDs
+3. New execute_step that works with CIDs ✓
 4. Gradually deprecate local cache code
 5. Simplify Redis to just claims + cache_id→CID
 
