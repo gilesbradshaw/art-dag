@@ -87,7 +87,9 @@ All test outputs are stored locally and git-ignored:
 
 | Output | Description |
 |--------|-------------|
-| `test_cache/` | Cached execution results (media files, analysis) |
+| `test_cache/` | Cached execution results (media files, analysis, plans) |
+| `test_cache/plans/` | Cached execution plans by plan_id |
+| `test_cache/analysis/` | Cached analysis results by input hash |
 | `test_plan_output.json` | Generated execution plan from `test_plan.py` |
 
 ## Unit Tests
@@ -159,11 +161,11 @@ Same inputs always produce same cache IDs, enabling:
 ### Local Caching
 
 The `test_cache/` directory stores:
-- Intermediate media files
-- Analysis results
-- Execution artifacts
+- `plans/{plan_id}.json` - Execution plans (deterministic hash of recipe + inputs + analysis)
+- `analysis/{hash}.json` - Analysis results (audio beats, tempo, energy)
+- `{cache_id}/output.mkv` - Media outputs from each step
 
-Subsequent test runs automatically skip cached steps.
+Subsequent test runs automatically skip cached steps. Plans are cached by their `plan_id`, which is a SHA3-256 hash of the recipe, input hashes, and analysis results - so the same recipe with the same inputs always produces the same plan.
 
 ### No External Dependencies
 
@@ -177,14 +179,20 @@ Offline testing requires:
 1. **Check cache contents:**
    ```bash
    ls -la test_cache/
+   ls -la test_cache/plans/
    ```
 
-2. **View execution plan structure:**
+2. **View cached plan:**
+   ```bash
+   cat test_cache/plans/*.json | python3 -m json.tool | head -50
+   ```
+
+3. **View execution plan structure:**
    ```bash
    cat test_plan_output.json | python3 -m json.tool
    ```
 
-3. **Run with verbose output:**
+4. **Run with verbose output:**
    ```bash
    python3 -m artdag.cli run-recipe examples/simple_sequence.yaml \
        -i "video:HASH@path" \
@@ -192,7 +200,7 @@ Offline testing requires:
        -v
    ```
 
-4. **Dry-run to see what would execute:**
+5. **Dry-run to see what would execute:**
    ```bash
    python3 -m artdag.cli execute plan.json --dry-run
    ```
