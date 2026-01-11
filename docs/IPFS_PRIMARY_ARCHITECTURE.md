@@ -298,25 +298,54 @@ Or use IPFS pubsub for coordination.
 
 ## Implementation
 
-The simplified architecture is implemented in:
+The simplified architecture is implemented in `art-celery/tasks/`:
 
-- `art-celery/tasks/execute_cid.py` - CID-based step execution
+| File | Purpose |
+|------|---------|
+| `execute_cid.py` | Step execution with CIDs |
+| `analyze_cid.py` | Analysis with CIDs |
+| `orchestrate_cid.py` | Full pipeline orchestration |
 
-Key functions:
-- `execute_step_cid(step_json, input_cids)` - Execute single step, return CID
-- `execute_plan_cid(plan_json, input_cids)` - Execute entire plan, return output CID
+### Key Functions
 
-Redis usage (minimal):
-- `artdag:cid_cache` - Hash: cache_id → CID
-- `artdag:claim:{cache_id}` - String: worker_id (TTL 5 min)
+**Registration (local → IPFS):**
+- `register_input_cid(path)` → `{cid, content_hash}`
+- `register_recipe_cid(path)` → `{cid, name, version}`
+
+**Analysis:**
+- `analyze_input_cid(input_cid, input_hash, features)` → `{analysis_cid}`
+
+**Planning:**
+- `generate_plan_cid(recipe_cid, input_cids, input_hashes, analysis_cids)` → `{plan_cid}`
+
+**Execution:**
+- `execute_step_cid(step_json, input_cids)` → `{cid}`
+- `execute_plan_from_cid(plan_cid, input_cids)` → `{output_cid}`
+
+**Full Pipeline:**
+- `run_recipe_cid(recipe_cid, input_cids, input_hashes)` → `{output_cid, all_cids}`
+- `run_from_local(recipe_path, input_paths)` → registers + runs
+
+### Redis Usage (minimal)
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `artdag:cid_cache` | Hash | cache_id → output CID |
+| `artdag:analysis_cid` | Hash | input_hash:features → analysis CID |
+| `artdag:plan_cid` | Hash | plan_id → plan CID |
+| `artdag:run_cid` | Hash | run_id → output CID |
+| `artdag:claim:{cache_id}` | String | worker_id (TTL 5 min) |
 
 ## Migration Path
 
-1. Keep current system working
-2. Add `--ipfs-primary` flag to CLI
-3. New execute_step that works with CIDs ✓
+1. Keep current system working ✓
+2. Add CID-based tasks ✓
+   - `execute_cid.py` ✓
+   - `analyze_cid.py` ✓
+   - `orchestrate_cid.py` ✓
+3. Add `--ipfs-primary` flag to CLI
 4. Gradually deprecate local cache code
-5. Simplify Redis to just claims + cache_id→CID
+5. Remove old tasks when CID versions are stable
 
 ## See Also
 
