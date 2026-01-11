@@ -296,6 +296,48 @@ Or use IPFS pubsub for coordination.
 2. **Initial fetch latency** - First fetch may be slower than local disk
 3. **IPNS latency** - Name resolution can be slow (Option C avoids this)
 
+## Trust Domains (Cluster Key)
+
+Systems can share work through IPFS, but how do you trust them?
+
+**Problem:** A malicious system could return wrong CIDs for computed steps.
+
+**Solution:** Cluster key creates isolated trust domains:
+
+```bash
+export ARTDAG_CLUSTER_KEY="my-secret-shared-key"
+```
+
+**How it works:**
+- The cluster key is mixed into all cache_id computations
+- Systems with the same key produce the same cache_ids
+- Systems with different keys have separate cache namespaces
+- Only share the key with trusted partners
+
+```
+cache_id = SHA3-256(cluster_key + node_type + config + inputs)
+```
+
+**Trust model:**
+| Scenario | Same Key? | Can Share Work? |
+|----------|-----------|-----------------|
+| Same organization | Yes | Yes |
+| Trusted partner | Yes (shared) | Yes |
+| Unknown system | No | No (different cache_ids) |
+
+**Configuration:**
+```yaml
+# docker-compose.yml
+environment:
+  - ARTDAG_CLUSTER_KEY=your-secret-key-here
+```
+
+**Programmatic:**
+```python
+from artdag.planning.schema import set_cluster_key
+set_cluster_key("my-secret-key")
+```
+
 ## Implementation
 
 The simplified architecture is implemented in `art-celery/tasks/`:

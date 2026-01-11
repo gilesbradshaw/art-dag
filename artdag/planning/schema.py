@@ -8,14 +8,42 @@ with pre-computed cache IDs for each step.
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 
+# Cluster key for trust domains
+# Systems with the same key produce the same cache_ids and can share work
+# Systems with different keys have isolated cache namespaces
+CLUSTER_KEY: Optional[str] = os.environ.get("ARTDAG_CLUSTER_KEY")
+
+
+def set_cluster_key(key: Optional[str]) -> None:
+    """Set the cluster key programmatically."""
+    global CLUSTER_KEY
+    CLUSTER_KEY = key
+
+
+def get_cluster_key() -> Optional[str]:
+    """Get the current cluster key."""
+    return CLUSTER_KEY
+
+
 def _stable_hash(data: Any, algorithm: str = "sha3_256") -> str:
-    """Create stable hash from arbitrary data."""
+    """
+    Create stable hash from arbitrary data.
+
+    If ARTDAG_CLUSTER_KEY is set, it's mixed into the hash to create
+    isolated trust domains. Systems with the same key can share work;
+    systems with different keys have separate cache namespaces.
+    """
+    # Mix in cluster key if set
+    if CLUSTER_KEY:
+        data = {"_cluster_key": CLUSTER_KEY, "_data": data}
+
     json_str = json.dumps(data, sort_keys=True, separators=(",", ":"))
     hasher = hashlib.new(algorithm)
     hasher.update(json_str.encode())
