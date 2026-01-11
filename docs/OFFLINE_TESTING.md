@@ -204,3 +204,8 @@ Offline testing requires:
    ```bash
    python3 -m artdag.cli execute plan.json --dry-run
    ```
+
+## See Also
+
+- [L1_STORAGE.md](L1_STORAGE.md) - Distributed storage on L1 (IPFS, Redis, PostgreSQL)
+- [EXECUTION_MODEL.md](EXECUTION_MODEL.md) - 3-phase execution model
