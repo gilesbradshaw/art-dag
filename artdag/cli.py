@@ -432,6 +432,233 @@ def cmd_run_recipe(args):
         print(f"Output: {output_path}")
 
 
+def cmd_run_recipe_ipfs(args):
+    """Run complete pipeline with IPFS-primary mode.
+
+    Everything stored on IPFS:
+    - Inputs (media files)
+    - Analysis results (JSON)
+    - Execution plans (JSON)
+    - Step outputs (media files)
+    """
+    import hashlib
+    import shutil
+    import tempfile
+
+    from .analysis import Analyzer, AnalysisResult
+    from .planning import RecipePlanner, Recipe, ExecutionPlan
+    from .executor import get_executor
+    from .dag import NodeType
+    from . import nodes  # Register built-in executors
+
+    # Check for ipfs_client
+    try:
+        from art_celery import ipfs_client
+    except ImportError:
+        # Try relative import for when running from art-celery
+        try:
+            import ipfs_client
+        except ImportError:
+            print("Error: ipfs_client not available. Install art-celery or run from art-celery directory.")
+            sys.exit(1)
+
+    # Check IPFS availability
+    if not ipfs_client.is_available():
+        print("Error: IPFS daemon not available. Start IPFS with 'ipfs daemon'")
+        sys.exit(1)
+
+    print("=== IPFS-Primary Mode ===")
+    print(f"IPFS Node: {ipfs_client.get_node_id()[:16]}...")
+
+    # Load recipe
+    recipe_path = Path(args.recipe)
+    recipe = Recipe.from_file(recipe_path)
+    print(f"\nRecipe: {recipe.name} v{recipe.version}")
+
+    # Parse inputs
+    input_hashes, input_paths = parse_inputs(args.input)
+
+    # Parse features
+    features = args.features.split(",") if args.features else ["beats", "energy"]
+
+    # Phase 0: Register on IPFS
+    print("\n=== Phase 0: Register on IPFS ===")
+
+    # Register recipe
+    recipe_bytes = recipe_path.read_bytes()
+    recipe_cid = ipfs_client.add_bytes(recipe_bytes)
+    print(f"Recipe CID: {recipe_cid}")
+
+    # Register inputs
+    input_cids = {}
+    for name, hash_value in input_hashes.items():
+        path = input_paths.get(name)
+        if path:
+            cid = ipfs_client.add_file(Path(path))
+            if cid:
+                input_cids[name] = cid
+                print(f"Input '{name}': {cid}")
+            else:
+                print(f"Error: Failed to add input '{name}' to IPFS")
+                sys.exit(1)
+
+    # Phase 1: Analyze
+    print("\n=== Phase 1: Analysis ===")
+
+    # Create temp dir for analysis
+    work_dir = Path(tempfile.mkdtemp(prefix="artdag_ipfs_"))
+    analysis_cids = {}
+    analysis = {}
+
+    try:
+        for name, hash_value in input_hashes.items():
+            input_cid = input_cids.get(name)
+            if not input_cid:
+                continue
+
+            print(f"Analyzing {name}...")
+
+            # Fetch from IPFS to temp
+            temp_input = work_dir / f"input_{name}.mkv"
+            if not ipfs_client.get_file(input_cid, temp_input):
+                print(f"  Error: Failed to fetch from IPFS")
+                continue
+
+            # Run analysis
+            analyzer = Analyzer(cache_dir=None)
+            result = analyzer.analyze(
+                input_hash=hash_value,
+                features=features,
+                input_path=temp_input,
+            )
+
+            if result.audio and result.audio.beats:
+                print(f"  Tempo: {result.audio.beats.tempo:.1f} BPM, {len(result.audio.beats.beat_times)} beats")
+
+            # Store analysis on IPFS
+            analysis_cid = ipfs_client.add_json(result.to_dict())
+            if analysis_cid:
+                analysis_cids[hash_value] = analysis_cid
+                analysis[hash_value] = result
+                print(f"  Analysis CID: {analysis_cid}")
+
+        # Phase 2: Plan
+        print("\n=== Phase 2: Planning ===")
+
+        planner = RecipePlanner(use_tree_reduction=True)
+        plan = planner.plan(
+            recipe=recipe,
+            input_hashes=input_hashes,
+            analysis=analysis if analysis else None,
+        )
+
+        # Store plan on IPFS
+        import json
+        plan_dict = json.loads(plan.to_json())
+        plan_cid = ipfs_client.add_json(plan_dict)
+        print(f"Plan ID: {plan.plan_id[:16]}...")
+        print(f"Plan CID: {plan_cid}")
+        print(f"Steps: {len(plan.steps)}")
+
+        steps_by_level = plan.get_steps_by_level()
+        print(f"Levels: {len(steps_by_level)}")
+
+        # Phase 3: Execute
+        print("\n=== Phase 3: Execution ===")
+
+        # CID results
+        cid_results = dict(input_cids)
+        step_cids = {}
+
+        executed = 0
+        cached = 0
+
+        for level in sorted(steps_by_level.keys()):
+            steps = steps_by_level[level]
+            print(f"\nLevel {level}: {len(steps)} steps")
+
+            for step in steps:
+                # Handle SOURCE
+                if step.node_type == "SOURCE":
+                    source_name = step.config.get("name") or step.step_id
+                    cid = cid_results.get(source_name)
+                    if cid:
+                        step_cids[step.step_id] = cid
+                        print(f"  [SOURCE] {step.step_id}")
+                    continue
+
+                print(f"  [RUNNING] {step.step_id}: {step.node_type}...")
+
+                try:
+                    node_type = NodeType[step.node_type]
+                except KeyError:
+                    node_type = step.node_type
+
+                executor = get_executor(node_type)
+                if executor is None:
+                    print(f"    SKIP: No executor for {step.node_type}")
+                    continue
+
+                # Fetch inputs from IPFS
+                input_paths_list = []
+                for i, input_step_id in enumerate(step.input_steps):
+                    input_cid = step_cids.get(input_step_id) or cid_results.get(input_step_id)
+                    if not input_cid:
+                        print(f"    ERROR: Missing input CID for {input_step_id}")
+                        continue
+
+                    temp_path = work_dir / f"step_{step.step_id}_input_{i}.mkv"
+                    if not ipfs_client.get_file(input_cid, temp_path):
+                        print(f"    ERROR: Failed to fetch {input_cid}")
+                        continue
+                    input_paths_list.append(temp_path)
+
+                if len(input_paths_list) != len(step.input_steps):
+                    print(f"    ERROR: Missing inputs")
+                    continue
+
+                # Execute
+                output_path = work_dir / f"step_{step.step_id}_output.mkv"
+                try:
+                    result_path = executor.execute(step.config, input_paths_list, output_path)
+
+                    # Add to IPFS
+                    output_cid = ipfs_client.add_file(result_path)
+                    if output_cid:
+                        step_cids[step.step_id] = output_cid
+                        print(f"    [DONE] CID: {output_cid}")
+                        executed += 1
+                    else:
+                        print(f"    [FAILED] Could not add to IPFS")
+                except Exception as e:
+                    print(f"    [FAILED] {e}")
+
+        # Final output
+        output_step = plan.get_step(plan.output_step)
+        output_cid = step_cids.get(output_step.step_id) if output_step else None
+
+        print(f"\n=== Complete ===")
+        print(f"Executed: {executed}")
+        if output_cid:
+            print(f"Output CID: {output_cid}")
+            print(f"Fetch with: ipfs get {output_cid}")
+
+        # Summary of all CIDs
+        print(f"\n=== All CIDs ===")
+        print(f"Recipe: {recipe_cid}")
+        print(f"Plan: {plan_cid}")
+        for name, cid in input_cids.items():
+            print(f"Input '{name}': {cid}")
+        for hash_val, cid in analysis_cids.items():
+            print(f"Analysis '{hash_val[:16]}...': {cid}")
+        if output_cid:
+            print(f"Output: {output_cid}")
+
+    finally:
+        # Cleanup temp
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="artdag",
@@ -472,6 +699,8 @@ def main():
                             help="Input: name:hash[@path]")
     run_parser.add_argument("--features", help="Features to extract (comma-separated)")
     run_parser.add_argument("--cache-dir", help="Cache directory")
+    run_parser.add_argument("--ipfs-primary", action="store_true",
+                            help="Use IPFS-primary mode (everything on IPFS, no local cache)")
 
     args = parser.parse_args()
 
@@ -482,7 +711,10 @@ def main():
     elif args.command == "execute":
         cmd_execute(args)
     elif args.command == "run-recipe":
-        cmd_run_recipe(args)
+        if getattr(args, 'ipfs_primary', False):
+            cmd_run_recipe_ipfs(args)
+        else:
+            cmd_run_recipe(args)
     else:
         parser.print_help()
         sys.exit(1)
