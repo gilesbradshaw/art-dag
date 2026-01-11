@@ -163,6 +163,7 @@ def cmd_execute(args):
     from .cache import Cache
     from .executor import get_executor
     from .dag import NodeType
+    from . import nodes  # Register built-in executors
 
     # Load plan
     with open(args.plan, "r") as f:
@@ -214,9 +215,9 @@ def cmd_execute(args):
 
         for step in steps:
             if cache.has(step.cache_id):
-                entry = cache.get(step.cache_id)
-                cache_paths[step.cache_id] = str(entry.output_path)
-                cache_paths[step.step_id] = str(entry.output_path)
+                cached_path = cache.get(step.cache_id)
+                cache_paths[step.cache_id] = str(cached_path)
+                cache_paths[step.step_id] = str(cached_path)
                 print(f"  [CACHED] {step.step_id}")
                 cached += 1
                 continue
@@ -278,6 +279,7 @@ def cmd_run_recipe(args):
     from .cache import Cache
     from .executor import get_executor
     from .dag import NodeType
+    from . import nodes  # Register built-in executors
 
     # Load recipe
     recipe = Recipe.from_file(Path(args.recipe))
@@ -314,13 +316,31 @@ def cmd_run_recipe(args):
 
     # Phase 2: Plan
     print("\n=== Phase 2: Planning ===")
-    planner = RecipePlanner(use_tree_reduction=True)
 
+    # Check for cached plan
+    plans_dir = cache_dir / "plans"
+    plans_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate plan to get plan_id (deterministic hash)
+    planner = RecipePlanner(use_tree_reduction=True)
     plan = planner.plan(
         recipe=recipe,
         input_hashes=input_hashes,
         analysis=analysis,
     )
+
+    plan_cache_path = plans_dir / f"{plan.plan_id}.json"
+
+    if plan_cache_path.exists():
+        print(f"Plan cached: {plan.plan_id[:16]}...")
+        from .planning import ExecutionPlan
+        with open(plan_cache_path, "r") as f:
+            plan = ExecutionPlan.from_json(f.read())
+    else:
+        # Save plan to cache
+        with open(plan_cache_path, "w") as f:
+            f.write(plan.to_json())
+        print(f"Plan saved: {plan.plan_id[:16]}...")
 
     print(f"Plan: {len(plan.steps)} steps")
     steps_by_level = plan.get_steps_by_level()
@@ -348,9 +368,9 @@ def cmd_run_recipe(args):
 
         for step in steps:
             if cache.has(step.cache_id):
-                entry = cache.get(step.cache_id)
-                cache_paths[step.cache_id] = str(entry.output_path)
-                cache_paths[step.step_id] = str(entry.output_path)
+                cached_path = cache.get(step.cache_id)
+                cache_paths[step.cache_id] = str(cached_path)
+                cache_paths[step.step_id] = str(cached_path)
                 print(f"  [CACHED] {step.step_id}")
                 cached += 1
                 continue
