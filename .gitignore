@@ -38,3 +38,10 @@ venv/
 
 # Private keys (ActivityPub secrets)
 .cache/
+
+# Test outputs
+test_cache/
+test_plan_output.json
+analysis.json
+plan.json
+plan_with_analysis.json

@@ -1,0 +1,42 @@
+# Simple sequence recipe - concatenates segments from a single input video
+name: simple_sequence
+version: "1.0"
+description: "Split input into segments and concatenate them"
+owner: test@local
+
+dag:
+  nodes:
+    # Input source - variable (provided at runtime)
+    - id: video
+      type: SOURCE
+      config:
+        input: true
+        name: "Input Video"
+        description: "The video to process"
+
+    # Extract first 2 seconds
+    - id: seg1
+      type: SEGMENT
+      config:
+        start: 0.0
+        end: 2.0
+      inputs:
+        - video
+
+    # Extract seconds 5-7
+    - id: seg2
+      type: SEGMENT
+      config:
+        start: 5.0
+        end: 7.0
+      inputs:
+        - video
+
+    # Concatenate the segments
+    - id: output
+      type: SEQUENCE
+      inputs:
+        - seg1
+        - seg2
+
+  output: output
