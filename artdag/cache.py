@@ -356,10 +356,23 @@ class Cache:
         Returns:
             Content hash (cache ID) of the effect
         """
-        from .effects.loader import load_effect
+        import hashlib as _hashlib
 
-        loaded = load_effect(source)
-        content_hash = loaded.content_hash
+        # Compute content hash
+        content_hash = _hashlib.sha3_256(source.encode("utf-8")).hexdigest()
+
+        # Try to load full metadata if effects module available
+        try:
+            from .effects.loader import load_effect
+            loaded = load_effect(source)
+            meta_dict = loaded.meta.to_dict()
+            dependencies = loaded.dependencies
+            requires_python = loaded.requires_python
+        except ImportError:
+            # Fallback: store without parsed metadata
+            meta_dict = {}
+            dependencies = []
+            requires_python = ">=3.10"
 
         effect_dir = self._effects_dir() / content_hash
         effect_dir.mkdir(parents=True, exist_ok=True)
@@ -371,9 +384,9 @@ class Cache:
         # Store metadata
         metadata = {
             "content_hash": content_hash,
-            "meta": loaded.meta.to_dict(),
-            "dependencies": loaded.dependencies,
-            "requires_python": loaded.requires_python,
+            "meta": meta_dict,
+            "dependencies": dependencies,
+            "requires_python": requires_python,
             "stored_at": time.time(),
         }
         metadata_path = effect_dir / "metadata.json"
