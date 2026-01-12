@@ -16,13 +16,20 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from types import ModuleType
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 import requests
 
 from ..executor import Executor, register_executor
 
 logger = logging.getLogger(__name__)
+
+# Type alias for effect functions: (input_path, output_path, config) -> output_path
+EffectFn = Callable[[Path, Path, Dict[str, Any]], Path]
+
+# Type variable for decorator
+F = TypeVar("F", bound=Callable[..., Any])
 
 # IPFS API multiaddr - same as ipfs_client.py for consistency
 # Docker uses /dns/ipfs/tcp/5001, local dev uses /ip4/127.0.0.1/tcp/5001
@@ -104,7 +111,7 @@ def _fetch_effect_from_ipfs(cid: str, effect_path: Path) -> bool:
         return False
 
 
-def _load_cached_effect(effect_cid: str) -> Optional[callable]:
+def _load_cached_effect(effect_cid: str) -> Optional[EffectFn]:
     """
     Load an effect by CID, fetching from IPFS if not cached locally.
 
@@ -160,7 +167,7 @@ def _load_cached_effect(effect_cid: str) -> Optional[callable]:
         return None
 
 
-def _wrap_frame_effect(module, effect_path: Path) -> callable:
+def _wrap_frame_effect(module: ModuleType, effect_path: Path) -> EffectFn:
     """Wrap a frame-by-frame effect to work with the executor API."""
 
     def wrapped_effect(input_path: Path, output_path: Path, config: Dict[str, Any]) -> Path:
@@ -198,7 +205,7 @@ def _wrap_frame_effect(module, effect_path: Path) -> callable:
     return wrapped_effect
 
 
-def _wrap_video_effect(module) -> callable:
+def _wrap_video_effect(module: ModuleType) -> EffectFn:
     """Wrap a whole-video effect to work with the executor API."""
 
     def wrapped_effect(input_path: Path, output_path: Path, config: Dict[str, Any]) -> Path:
@@ -224,18 +231,18 @@ def _wrap_video_effect(module) -> callable:
 
 
 # Effect registry - maps effect names to implementations
-_EFFECTS: Dict[str, callable] = {}
+_EFFECTS: Dict[str, EffectFn] = {}
 
 
-def register_effect(name: str):
+def register_effect(name: str) -> Callable[[F], F]:
     """Decorator to register an effect implementation."""
-    def decorator(func):
-        _EFFECTS[name] = func
+    def decorator(func: F) -> F:
+        _EFFECTS[name] = func  # type: ignore[assignment]
         return func
     return decorator
 
 
-def get_effect(name: str):
+def get_effect(name: str) -> Optional[EffectFn]:
     """Get an effect implementation by name."""
     return _EFFECTS.get(name)
 
@@ -299,7 +306,7 @@ class EffectExecutor(Executor):
             raise ValueError(f"EFFECT expects 1 input, got {len(inputs)}")
 
         # Try IPFS effect first if CID provided
-        effect_fn = None
+        effect_fn: Optional[EffectFn] = None
         if effect_cid:
             effect_fn = _load_cached_effect(effect_cid)
             if effect_fn:
