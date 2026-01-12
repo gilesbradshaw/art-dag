@@ -448,9 +448,9 @@ def _resolve_config(
             resolved["filter_chain"] = resolved_chain
 
         elif key == "asset" and isinstance(value, str):
-            # Resolve asset reference
+            # Resolve asset reference - use CID from registry
             if value in registry.get("assets", {}):
-                resolved["hash"] = registry["assets"][value]["hash"]
+                resolved["cid"] = registry["assets"][value]["cid"]
             else:
                 resolved["asset"] = value  # Keep as-is if not in registry
 

@@ -248,7 +248,7 @@ def _parse_kwargs(expr: List, start: int = 1) -> Tuple[List[Any], Dict[str, Any]
 
 
 def _compile_asset(expr: List, ctx: CompilerContext) -> None:
-    """Compile (asset name :hash "..." :url "...")"""
+    """Compile (asset name :cid "..." :url "...") or legacy (asset name :hash "...")"""
     if len(expr) < 2:
         raise CompileError("asset requires a name")
 
@@ -258,11 +258,13 @@ def _compile_asset(expr: List, ctx: CompilerContext) -> None:
 
     _, kwargs = _parse_kwargs(expr, 2)
 
-    if "hash" not in kwargs:
-        raise CompileError(f"asset {name} requires :hash")
+    # Support both :cid (new IPFS) and :hash (legacy SHA3-256)
+    asset_cid = kwargs.get("cid") or kwargs.get("hash")
+    if not asset_cid:
+        raise CompileError(f"asset {name} requires :cid or :hash")
 
     ctx.registry["assets"][name] = {
-        "hash": kwargs["hash"],
+        "cid": asset_cid,
         "url": kwargs.get("url"),
     }
     return None
