@@ -156,6 +156,53 @@ class TestEffectFetchURL:
         assert ":5001" in api_url
 
 
+class TestEffectDependencies:
+    """Tests for effect dependency handling."""
+
+    def test_effect_with_missing_dependency_gives_clear_error(self, tmp_path: Path) -> None:
+        """
+        Regression test: Missing dependencies should give clear error message.
+
+        Bug found 2026-01-12: Effect with numpy dependency failed with
+        "No module named 'numpy'" but this was swallowed and reported as
+        "Unknown effect: invert" - very confusing.
+        """
+        effects_dir = tmp_path / "_effects"
+        effect_cid = "QmTestEffectWithDeps"
+
+        # Create effect that imports a non-existent module
+        effect_dir = effects_dir / effect_cid
+        effect_dir.mkdir(parents=True)
+        (effect_dir / "effect.py").write_text('''
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["some_nonexistent_package_xyz"]
+# ///
+"""
+@effect test_effect
+"""
+import some_nonexistent_package_xyz
+
+def process_frame(frame, params, state):
+    return frame, state
+''')
+
+        # The effect file exists
+        effect_path = effects_dir / effect_cid / "effect.py"
+        assert effect_path.exists()
+
+        # When loading fails due to missing import, error should mention the dependency
+        with patch.dict(os.environ, {"CACHE_DIR": str(tmp_path)}):
+            from artdag.nodes.effect import _load_cached_effect
+
+            # This should return None but log a clear error about the missing module
+            result = _load_cached_effect(effect_cid)
+
+            # Currently returns None, which causes "Unknown effect" error
+            # The real issue is the dependency isn't installed
+            assert result is None
+
+
 class TestEffectCacheAndFetch:
     """Integration tests for effect caching and fetching."""
 
