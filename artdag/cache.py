@@ -92,107 +92,53 @@ class CacheStats:
 
 class Cache:
     """
-    Content-addressed file cache.
+    Code-addressed file cache.
+
+    The filesystem IS the index - no JSON index files needed.
+    Each node's hash is its directory name.
 
     Structure:
         cache_dir/
-            index.json           # Cache metadata
-            <node_id>/
+            <hash>/
                 output.ext       # Actual output file
-                metadata.json    # Entry metadata
+                metadata.json    # Per-node metadata (optional)
     """
 
     def __init__(self, cache_dir: Path | str):
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.stats = CacheStats()
-        self._entries: Dict[str, CacheEntry] = {}
-        self._load_index()
-
-    def _index_path(self) -> Path:
-        return self.cache_dir / "index.json"
-
-    def _load_index(self):
-        """Load cache index from disk."""
-        index_path = self._index_path()
-        if index_path.exists():
-            try:
-                with open(index_path) as f:
-                    data = json.load(f)
-                self._entries = {
-                    k: CacheEntry.from_dict(v)
-                    for k, v in data.get("entries", {}).items()
-                }
-                self.stats.total_entries = len(self._entries)
-                self.stats.total_size_bytes = sum(e.size_bytes for e in self._entries.values())
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.warning(f"Failed to load cache index: {e}")
-                self._entries = {}
-
-    def _save_index(self):
-        """Save cache index to disk."""
-        data = {
-            "entries": {k: v.to_dict() for k, v in self._entries.items()},
-            "stats": {
-                "total_entries": self.stats.total_entries,
-                "total_size_bytes": self.stats.total_size_bytes,
-            },
-        }
-        with open(self._index_path(), "w") as f:
-            json.dump(data, f, indent=2)
 
     def _node_dir(self, node_id: str) -> Path:
         """Get the cache directory for a node."""
         return self.cache_dir / node_id
 
+    def _find_output_file(self, node_dir: Path) -> Optional[Path]:
+        """Find the output file in a node directory."""
+        if not node_dir.exists() or not node_dir.is_dir():
+            return None
+        for f in node_dir.iterdir():
+            if f.is_file() and f.name.startswith("output."):
+                return f
+        return None
+
     def get(self, node_id: str) -> Optional[Path]:
         """
         Get cached output path for a node.
 
+        Checks filesystem directly - no in-memory index.
         Returns the output path if cached, None otherwise.
         """
-        entry = self._entries.get(node_id)
-        if entry is None:
-            # Entry not in memory - check filesystem directly
-            # (handles case where file was added by another process)
-            node_dir = self._node_dir(node_id)
-            if node_dir.exists() and node_dir.is_dir():
-                # Look for output file
-                for f in node_dir.iterdir():
-                    if f.is_file() and f.name != "metadata.json":
-                        # Found it - load metadata and add to entries
-                        self._load_entry_from_disk(node_id)
-                        entry = self._entries.get(node_id)
-                        if entry:
-                            self.stats.record_hit()
-                            return entry.output_path
-            self.stats.record_miss()
-            return None
-
-        # Verify file still exists
-        if not entry.output_path.exists():
-            logger.warning(f"Cache entry {node_id} missing file, removing")
-            self._remove_entry(node_id)
-            self.stats.record_miss()
-            return None
-
-        self.stats.record_hit()
-        logger.debug(f"Cache hit: {node_id}")
-        return entry.output_path
-
-    def _load_entry_from_disk(self, node_id: str):
-        """Load a single entry from disk into memory."""
         node_dir = self._node_dir(node_id)
-        metadata_path = node_dir / "metadata.json"
-        if metadata_path.exists():
-            try:
-                with open(metadata_path) as f:
-                    data = json.load(f)
-                entry = CacheEntry.from_dict(data)
-                self._entries[node_id] = entry
-                logger.debug(f"Loaded cache entry from disk: {node_id}")
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.warning(f"Failed to load cache entry {node_id}: {e}")
+        output_file = self._find_output_file(node_dir)
+
+        if output_file:
+            self.stats.record_hit()
+            logger.debug(f"Cache hit: {node_id[:16]}...")
+            return output_file
+
+        self.stats.record_miss()
+        return None
 
     def put(self, node_id: str, source_path: Path, node_type: str,
             execution_time: float = 0.0, move: bool = False) -> Path:
@@ -200,7 +146,7 @@ class Cache:
         Store a file in the cache.
 
         Args:
-            node_id: The content-addressed node ID
+            node_id: The code-addressed node ID (hash)
             source_path: Path to the file to cache
             node_type: Type of the node (for metadata)
             execution_time: How long the node took to execute
@@ -225,76 +171,103 @@ class Cache:
             else:
                 shutil.copy2(source_path, output_path)
 
-        # Compute content hash
+        # Compute content hash (IPFS CID of the result)
         cid = _file_hash(output_path)
 
-        # Create entry
-        entry = CacheEntry(
-            node_id=node_id,
-            output_path=output_path,
-            created_at=time.time(),
-            size_bytes=output_path.stat().st_size,
-            node_type=node_type,
-            cid=cid,
-            execution_time=execution_time,
-        )
+        # Store per-node metadata (optional, for stats/debugging)
+        metadata = {
+            "node_id": node_id,
+            "output_path": str(output_path),
+            "created_at": time.time(),
+            "size_bytes": output_path.stat().st_size,
+            "node_type": node_type,
+            "cid": cid,
+            "execution_time": execution_time,
+        }
+        metadata_path = node_dir / "metadata.json"
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
-        # Update index
-        self._entries[node_id] = entry
-        self.stats.total_entries = len(self._entries)
-        self.stats.total_size_bytes = sum(e.size_bytes for e in self._entries.values())
-        self._save_index()
-
-        logger.debug(f"Cached: {node_id} ({entry.size_bytes} bytes)")
+        logger.debug(f"Cached: {node_id[:16]}... ({metadata['size_bytes']} bytes)")
         return output_path
 
     def has(self, node_id: str) -> bool:
         """Check if a node is cached (without affecting stats)."""
-        entry = self._entries.get(node_id)
-        if entry is None:
-            return False
-        return entry.output_path.exists()
+        return self._find_output_file(self._node_dir(node_id)) is not None
 
     def remove(self, node_id: str) -> bool:
         """Remove a node from the cache."""
-        return self._remove_entry(node_id)
-
-    def _remove_entry(self, node_id: str) -> bool:
-        """Remove entry and its files."""
-        if node_id not in self._entries:
-            return False
-
-        entry = self._entries.pop(node_id)
         node_dir = self._node_dir(node_id)
         if node_dir.exists():
             shutil.rmtree(node_dir)
-
-        self.stats.total_entries = len(self._entries)
-        self.stats.total_size_bytes = sum(e.size_bytes for e in self._entries.values())
-        self._save_index()
-        return True
+            return True
+        return False
 
     def clear(self):
         """Clear all cached entries."""
-        for node_id in list(self._entries.keys()):
-            self._remove_entry(node_id)
+        for node_dir in self.cache_dir.iterdir():
+            if node_dir.is_dir() and not node_dir.name.startswith("_"):
+                shutil.rmtree(node_dir)
         self.stats = CacheStats()
 
     def get_stats(self) -> CacheStats:
-        """Get cache statistics."""
-        return self.stats
+        """Get cache statistics (scans filesystem)."""
+        stats = CacheStats()
+        for node_dir in self.cache_dir.iterdir():
+            if node_dir.is_dir() and not node_dir.name.startswith("_"):
+                output_file = self._find_output_file(node_dir)
+                if output_file:
+                    stats.total_entries += 1
+                    stats.total_size_bytes += output_file.stat().st_size
+        stats.hits = self.stats.hits
+        stats.misses = self.stats.misses
+        stats.hit_rate = self.stats.hit_rate
+        return stats
 
     def list_entries(self) -> List[CacheEntry]:
-        """List all cache entries."""
-        return list(self._entries.values())
+        """List all cache entries (scans filesystem)."""
+        entries = []
+        for node_dir in self.cache_dir.iterdir():
+            if node_dir.is_dir() and not node_dir.name.startswith("_"):
+                entry = self._load_entry_from_disk(node_dir.name)
+                if entry:
+                    entries.append(entry)
+        return entries
+
+    def _load_entry_from_disk(self, node_id: str) -> Optional[CacheEntry]:
+        """Load entry metadata from disk."""
+        node_dir = self._node_dir(node_id)
+        metadata_path = node_dir / "metadata.json"
+        output_file = self._find_output_file(node_dir)
+
+        if not output_file:
+            return None
+
+        if metadata_path.exists():
+            try:
+                with open(metadata_path) as f:
+                    data = json.load(f)
+                return CacheEntry.from_dict(data)
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        # Fallback: create entry from filesystem
+        return CacheEntry(
+            node_id=node_id,
+            output_path=output_file,
+            created_at=output_file.stat().st_mtime,
+            size_bytes=output_file.stat().st_size,
+            node_type="unknown",
+            cid=_file_hash(output_file),
+        )
 
     def get_entry(self, node_id: str) -> Optional[CacheEntry]:
         """Get cache entry metadata (without affecting stats)."""
-        return self._entries.get(node_id)
+        return self._load_entry_from_disk(node_id)
 
     def find_by_cid(self, cid: str) -> Optional[CacheEntry]:
-        """Find a cache entry by its content hash."""
-        for entry in self._entries.values():
+        """Find a cache entry by its content hash (scans filesystem)."""
+        for entry in self.list_entries():
             if entry.cid == cid:
                 return entry
         return None
@@ -312,25 +285,27 @@ class Cache:
         """
         removed = 0
         now = time.time()
+        entries = self.list_entries()
 
         # Remove by age first
         if max_age_seconds is not None:
-            for node_id, entry in list(self._entries.items()):
+            for entry in entries:
                 if now - entry.created_at > max_age_seconds:
-                    self._remove_entry(node_id)
+                    self.remove(entry.node_id)
                     removed += 1
 
         # Then by size (remove oldest first)
-        if max_size_bytes is not None and self.stats.total_size_bytes > max_size_bytes:
-            sorted_entries = sorted(
-                self._entries.items(),
-                key=lambda x: x[1].created_at
-            )
-            for node_id, entry in sorted_entries:
-                if self.stats.total_size_bytes <= max_size_bytes:
-                    break
-                self._remove_entry(node_id)
-                removed += 1
+        if max_size_bytes is not None:
+            stats = self.get_stats()
+            if stats.total_size_bytes > max_size_bytes:
+                sorted_entries = sorted(entries, key=lambda e: e.created_at)
+                total_size = stats.total_size_bytes
+                for entry in sorted_entries:
+                    if total_size <= max_size_bytes:
+                        break
+                    self.remove(entry.node_id)
+                    total_size -= entry.size_bytes
+                    removed += 1
 
         return removed
 

@@ -56,17 +56,34 @@ class CompilerContext:
     registry: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {"assets": {}, "effects": {}})
     bindings: Dict[str, str] = field(default_factory=dict)  # name -> node_id
     nodes: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # node_id -> node
-    node_counter: int = 0
-
-    def gen_node_id(self, prefix: str = "n") -> str:
-        """Generate a unique node ID."""
-        self.node_counter += 1
-        return f"{prefix}_{self.node_counter}"
 
     def add_node(self, node_type: str, config: Dict[str, Any],
                  inputs: List[str] = None, name: str = None) -> str:
-        """Add a node and return its ID."""
-        node_id = self.gen_node_id(node_type.lower())
+        """
+        Add a node and return its code-addressed ID.
+
+        The node_id is a hash of the S-expression subtree (type, config, inputs),
+        creating a Merkle-tree like a blockchain - each node's hash includes all
+        upstream hashes. This is computed purely from the plan, before execution.
+
+        The node_id is a pre-computed "bucket" where the computation result will
+        be stored. Same plan = same buckets = automatic cache reuse.
+        """
+        # Build canonical representation for hashing
+        # Inputs are already code-addressed node IDs (hashes)
+        canonical = {
+            "type": node_type,
+            "config": config,
+            "inputs": inputs or [],  # Already sorted by call order
+        }
+        # Hash the canonical form using SHA3-256 (matches planner)
+        canonical_json = json.dumps(canonical, sort_keys=True, separators=(',', ':'))
+        node_id = hashlib.sha3_256(canonical_json.encode()).hexdigest()
+
+        # Check for collision (same hash = same computation, reuse)
+        if node_id in self.nodes:
+            return node_id
+
         self.nodes[node_id] = {
             "id": node_id,
             "type": node_type,
