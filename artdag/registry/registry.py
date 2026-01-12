@@ -44,12 +44,12 @@ class Asset:
     """
     A registered asset in the Art DAG.
 
-    The content_hash is the true identifier. URL and local_path are
+    The cid is the true identifier. URL and local_path are
     locations where the content can be fetched.
 
     Attributes:
         name: Unique name for the asset
-        content_hash: SHA-3-256 hash - the canonical identifier
+        cid: SHA-3-256 hash - the canonical identifier
         url: Public URL (canonical location)
         local_path: Optional local path (for local execution)
         asset_type: Type of asset (image, video, audio, etc.)
@@ -58,7 +58,7 @@ class Asset:
         created_at: Timestamp when added to registry
     """
     name: str
-    content_hash: str
+    cid: str
     url: Optional[str] = None
     local_path: Optional[Path] = None
     asset_type: str = "unknown"
@@ -74,7 +74,7 @@ class Asset:
     def to_dict(self) -> Dict[str, Any]:
         data = {
             "name": self.name,
-            "content_hash": self.content_hash,
+            "cid": self.cid,
             "asset_type": self.asset_type,
             "tags": self.tags,
             "metadata": self.metadata,
@@ -91,7 +91,7 @@ class Asset:
         local_path = data.get("local_path") or data.get("path")  # backwards compat
         return cls(
             name=data["name"],
-            content_hash=data["content_hash"],
+            cid=data["cid"],
             url=data.get("url"),
             local_path=Path(local_path) if local_path else None,
             asset_type=data.get("asset_type", "unknown"),
@@ -158,7 +158,7 @@ class Registry:
     def add(
         self,
         name: str,
-        content_hash: str,
+        cid: str,
         url: str = None,
         local_path: Path | str = None,
         asset_type: str = None,
@@ -170,7 +170,7 @@ class Registry:
 
         Args:
             name: Unique name for the asset
-            content_hash: SHA-3-256 hash of the content (the canonical identifier)
+            cid: SHA-3-256 hash of the content (the canonical identifier)
             url: Public URL where the asset can be fetched
             local_path: Optional local path (for local execution)
             asset_type: Type of asset (image, video, audio, etc.)
@@ -202,7 +202,7 @@ class Registry:
 
         asset = Asset(
             name=name,
-            content_hash=content_hash,
+            cid=cid,
             url=url,
             local_path=Path(local_path).resolve() if local_path else None,
             asset_type=asset_type,
@@ -241,11 +241,11 @@ class Registry:
         if not path.exists():
             raise FileNotFoundError(f"Asset file not found: {path}")
 
-        content_hash = _file_hash(path)
+        cid = _file_hash(path)
 
         return self.add(
             name=name,
-            content_hash=content_hash,
+            cid=cid,
             url=url,
             local_path=path,
             asset_type=asset_type,
@@ -277,10 +277,10 @@ class Registry:
         """Find assets of a specific type."""
         return [a for a in self._assets.values() if a.asset_type == asset_type]
 
-    def find_by_hash(self, content_hash: str) -> Optional[Asset]:
+    def find_by_hash(self, cid: str) -> Optional[Asset]:
         """Find an asset by content hash."""
         for asset in self._assets.values():
-            if asset.content_hash == content_hash:
+            if asset.cid == cid:
                 return asset
         return None
 

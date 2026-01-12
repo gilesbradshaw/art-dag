@@ -175,7 +175,7 @@ class RecipePlanner:
 
         # Build PlanInput objects from input_hashes
         plan_inputs = []
-        for name, content_hash in input_hashes.items():
+        for name, cid in input_hashes.items():
             # Try to find matching SOURCE node for media type
             media_type = "application/octet-stream"
             for node in recipe.nodes:
@@ -185,8 +185,8 @@ class RecipePlanner:
 
             plan_inputs.append(PlanInput(
                 name=name,
-                cache_id=content_hash,
-                content_hash=content_hash,
+                cache_id=cid,
+                cid=cid,
                 media_type=media_type,
             ))
 
@@ -444,13 +444,13 @@ class RecipePlanner:
             # Look up in user-provided inputs
             if node.id not in input_hashes:
                 raise ValueError(f"Missing input for SOURCE node '{node.id}'")
-            content_hash = input_hashes[node.id]
+            cid = input_hashes[node.id]
         # Fixed asset from registry?
         elif config.get("asset"):
             asset_name = config["asset"]
             if asset_name not in registry_hashes:
                 raise ValueError(f"Asset '{asset_name}' not found in registry")
-            content_hash = registry_hashes[asset_name]
+            cid = registry_hashes[asset_name]
         else:
             raise ValueError(f"SOURCE node '{node.id}' has no input or asset")
 
@@ -461,9 +461,9 @@ class RecipePlanner:
         step = ExecutionStep(
             step_id=node.id,
             node_type="SOURCE",
-            config={"input_ref": node.id, "content_hash": content_hash},
+            config={"input_ref": node.id, "cid": cid},
             input_steps=[],
-            cache_id=content_hash,  # SOURCE cache_id is just the content hash
+            cache_id=cid,  # SOURCE cache_id is just the content hash
             name=step_name,
         )
 
@@ -496,13 +496,13 @@ class RecipePlanner:
         base_name = f"{recipe_name}.{display_name}" if recipe_name else display_name
 
         steps = []
-        for i, content_hash in enumerate(items):
+        for i, cid in enumerate(items):
             step = ExecutionStep(
                 step_id=f"{node.id}_{i}",
                 node_type="SOURCE",
-                config={"input_ref": f"{node.id}[{i}]", "content_hash": content_hash},
+                config={"input_ref": f"{node.id}[{i}]", "cid": cid},
                 input_steps=[],
-                cache_id=content_hash,
+                cache_id=cid,
                 name=f"{base_name}[{i}]",
             )
             steps.append(step)

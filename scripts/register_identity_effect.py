@@ -54,12 +54,12 @@ def main():
 
     # Register the identity effect folder
     effect_path = Path(__file__).parent.parent / "effects" / "identity"
-    content_hash = folder_hash(effect_path)
+    cid = folder_hash(effect_path)
 
     asset, activity = manager.register_asset(
         actor=actor,
         name="effect:identity",
-        content_hash=content_hash,
+        cid=cid,
         local_path=effect_path,
         tags=["effect", "primitive", "identity"],
         metadata={
@@ -70,7 +70,7 @@ def main():
     )
 
     print(f"\nRegistered: {asset.name}")
-    print(f"  Hash: {asset.content_hash}")
+    print(f"  Hash: {asset.cid}")
     print(f"  Path: {asset.local_path}")
     print(f"  Activity: {activity.activity_id}")
     print(f"  Owner: {actor.handle}")

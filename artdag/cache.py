@@ -39,7 +39,7 @@ class CacheEntry:
     created_at: float
     size_bytes: int
     node_type: str
-    content_hash: str = ""  # SHA-3 hash of file content
+    cid: str = ""  # Content identifier (IPFS CID or local hash)
     execution_time: float = 0.0
 
     def to_dict(self) -> Dict:
@@ -49,19 +49,21 @@ class CacheEntry:
             "created_at": self.created_at,
             "size_bytes": self.size_bytes,
             "node_type": self.node_type,
-            "content_hash": self.content_hash,
+            "cid": self.cid,
             "execution_time": self.execution_time,
         }
 
     @classmethod
     def from_dict(cls, data: Dict) -> "CacheEntry":
+        # Support both "cid" and legacy "content_hash"
+        cid = data.get("cid") or data.get("content_hash", "")
         return cls(
             node_id=data["node_id"],
             output_path=Path(data["output_path"]),
             created_at=data["created_at"],
             size_bytes=data["size_bytes"],
             node_type=data["node_type"],
-            content_hash=data.get("content_hash", ""),
+            cid=cid,
             execution_time=data.get("execution_time", 0.0),
         )
 
@@ -224,7 +226,7 @@ class Cache:
                 shutil.copy2(source_path, output_path)
 
         # Compute content hash
-        content_hash = _file_hash(output_path)
+        cid = _file_hash(output_path)
 
         # Create entry
         entry = CacheEntry(
@@ -233,7 +235,7 @@ class Cache:
             created_at=time.time(),
             size_bytes=output_path.stat().st_size,
             node_type=node_type,
-            content_hash=content_hash,
+            cid=cid,
             execution_time=execution_time,
         )
 
@@ -290,10 +292,10 @@ class Cache:
         """Get cache entry metadata (without affecting stats)."""
         return self._entries.get(node_id)
 
-    def find_by_content_hash(self, content_hash: str) -> Optional[CacheEntry]:
+    def find_by_cid(self, cid: str) -> Optional[CacheEntry]:
         """Find a cache entry by its content hash."""
         for entry in self._entries.values():
-            if entry.content_hash == content_hash:
+            if entry.cid == cid:
                 return entry
         return None
 
@@ -359,7 +361,7 @@ class Cache:
         import hashlib as _hashlib
 
         # Compute content hash
-        content_hash = _hashlib.sha3_256(source.encode("utf-8")).hexdigest()
+        cid = _hashlib.sha3_256(source.encode("utf-8")).hexdigest()
 
         # Try to load full metadata if effects module available
         try:
@@ -374,7 +376,7 @@ class Cache:
             dependencies = []
             requires_python = ">=3.10"
 
-        effect_dir = self._effects_dir() / content_hash
+        effect_dir = self._effects_dir() / cid
         effect_dir.mkdir(parents=True, exist_ok=True)
 
         # Store source
@@ -383,7 +385,7 @@ class Cache:
 
         # Store metadata
         metadata = {
-            "content_hash": content_hash,
+            "cid": cid,
             "meta": meta_dict,
             "dependencies": dependencies,
             "requires_python": requires_python,
@@ -393,20 +395,20 @@ class Cache:
         with open(metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
 
-        logger.info(f"Stored effect '{loaded.meta.name}' with hash {content_hash[:16]}...")
-        return content_hash
+        logger.info(f"Stored effect '{loaded.meta.name}' with hash {cid[:16]}...")
+        return cid
 
-    def get_effect(self, content_hash: str) -> Optional[str]:
+    def get_effect(self, cid: str) -> Optional[str]:
         """
         Get effect source by content hash.
 
         Args:
-            content_hash: SHA3-256 hash of effect source
+            cid: SHA3-256 hash of effect source
 
         Returns:
             Effect source code if found, None otherwise
         """
-        effect_dir = self._effects_dir() / content_hash
+        effect_dir = self._effects_dir() / cid
         source_path = effect_dir / "effect.py"
 
         if not source_path.exists():
@@ -414,17 +416,17 @@ class Cache:
 
         return source_path.read_text(encoding="utf-8")
 
-    def get_effect_path(self, content_hash: str) -> Optional[Path]:
+    def get_effect_path(self, cid: str) -> Optional[Path]:
         """
         Get path to effect source file.
 
         Args:
-            content_hash: SHA3-256 hash of effect source
+            cid: SHA3-256 hash of effect source
 
         Returns:
             Path to effect.py if found, None otherwise
         """
-        effect_dir = self._effects_dir() / content_hash
+        effect_dir = self._effects_dir() / cid
         source_path = effect_dir / "effect.py"
 
         if not source_path.exists():
@@ -432,17 +434,17 @@ class Cache:
 
         return source_path
 
-    def get_effect_metadata(self, content_hash: str) -> Optional[dict]:
+    def get_effect_metadata(self, cid: str) -> Optional[dict]:
         """
         Get effect metadata by content hash.
 
         Args:
-            content_hash: SHA3-256 hash of effect source
+            cid: SHA3-256 hash of effect source
 
         Returns:
             Metadata dict if found, None otherwise
         """
-        effect_dir = self._effects_dir() / content_hash
+        effect_dir = self._effects_dir() / cid
         metadata_path = effect_dir / "metadata.json"
 
         if not metadata_path.exists():
@@ -454,9 +456,9 @@ class Cache:
         except (json.JSONDecodeError, KeyError):
             return None
 
-    def has_effect(self, content_hash: str) -> bool:
+    def has_effect(self, cid: str) -> bool:
         """Check if an effect is cached."""
-        effect_dir = self._effects_dir() / content_hash
+        effect_dir = self._effects_dir() / cid
         return (effect_dir / "effect.py").exists()
 
     def list_effects(self) -> List[dict]:
@@ -475,13 +477,13 @@ class Cache:
 
         return effects
 
-    def remove_effect(self, content_hash: str) -> bool:
+    def remove_effect(self, cid: str) -> bool:
         """Remove an effect from the cache."""
-        effect_dir = self._effects_dir() / content_hash
+        effect_dir = self._effects_dir() / cid
 
         if not effect_dir.exists():
             return False
 
         shutil.rmtree(effect_dir)
-        logger.info(f"Removed effect {content_hash[:16]}...")
+        logger.info(f"Removed effect {cid[:16]}...")
         return True

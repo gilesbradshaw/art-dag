@@ -11,7 +11,7 @@ sandboxed environments for determinism.
 """
 
 from .meta import EffectMeta, ParamSpec, ExecutionContext
-from .loader import load_effect, load_effect_file, LoadedEffect, compute_content_hash
+from .loader import load_effect, load_effect_file, LoadedEffect, compute_cid
 from .binding import (
     AnalysisData,
     ResolvedBinding,
@@ -33,7 +33,7 @@ __all__ = [
     "load_effect",
     "load_effect_file",
     "LoadedEffect",
-    "compute_content_hash",
+    "compute_cid",
     # Binding
     "AnalysisData",
     "ResolvedBinding",

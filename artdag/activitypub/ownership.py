@@ -24,13 +24,13 @@ class OwnershipRecord:
     Attributes:
         actor_handle: The actor's fediverse handle
         asset_name: Name of the owned asset
-        content_hash: SHA-3 hash of the asset
+        cid: SHA-3 hash of the asset
         activity_id: ID of the Create activity establishing ownership
         verified: Whether the signature has been verified
     """
     actor_handle: str
     asset_name: str
-    content_hash: str
+    cid: str
     activity_id: str
     verified: bool = False
 
@@ -66,7 +66,7 @@ class OwnershipManager:
         self,
         actor: Actor,
         name: str,
-        content_hash: str,
+        cid: str,
         url: str = None,
         local_path: Path | str = None,
         tags: List[str] = None,
@@ -81,7 +81,7 @@ class OwnershipManager:
         Args:
             actor: The actor claiming ownership
             name: Name for the asset
-            content_hash: SHA-3-256 hash of the content
+            cid: SHA-3-256 hash of the content
             url: Public URL (canonical location)
             local_path: Optional local path
             tags: Optional tags
@@ -93,7 +93,7 @@ class OwnershipManager:
         # Add to registry
         asset = self.registry.add(
             name=name,
-            content_hash=content_hash,
+            cid=cid,
             url=url,
             local_path=local_path,
             tags=tags,
@@ -104,7 +104,7 @@ class OwnershipManager:
         activity = CreateActivity.for_asset(
             actor=actor,
             asset_name=name,
-            content_hash=asset.content_hash,
+            cid=asset.cid,
             asset_type=self._asset_type_to_ap(asset.asset_type),
             metadata=metadata,
         )
@@ -139,7 +139,7 @@ class OwnershipManager:
             return None
 
         # Find Create activities for this asset
-        activities = self.activities.find_by_object_hash(asset.content_hash)
+        activities = self.activities.find_by_object_hash(asset.cid)
         create_activities = [a for a in activities if a.activity_type == "Create"]
 
         if not create_activities:
@@ -170,7 +170,7 @@ class OwnershipManager:
         if not asset:
             return False
 
-        activities = self.activities.find_by_object_hash(asset.content_hash)
+        activities = self.activities.find_by_object_hash(asset.cid)
         for activity in activities:
             if activity.activity_type == "Create" and activity.actor_id == actor.id:
                 if verify_activity_ownership(activity, actor):
@@ -218,7 +218,7 @@ class OwnershipManager:
             records.append(OwnershipRecord(
                 actor_handle=actor.handle if actor else f"@{username}@unknown",
                 asset_name=activity.object_data.get("name", "unknown"),
-                content_hash=hash_value or "unknown",
+                cid=hash_value or "unknown",
                 activity_id=activity.activity_id,
                 verified=verify_activity_ownership(activity, actor) if actor else False,
             ))

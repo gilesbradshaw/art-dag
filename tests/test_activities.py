@@ -17,13 +17,13 @@ class MockActivityPubStore:
     def __init__(self):
         self._shared_hashes = set()
 
-    def mark_shared(self, content_hash: str):
+    def mark_shared(self, cid: str):
         """Mark a content hash as shared (published)."""
-        self._shared_hashes.add(content_hash)
+        self._shared_hashes.add(cid)
 
-    def find_by_object_hash(self, content_hash: str):
+    def find_by_object_hash(self, cid: str):
         """Return mock activities for shared hashes."""
-        if content_hash in self._shared_hashes:
+        if cid in self._shared_hashes:
             return [MockActivity("Create")]
         return []
 
@@ -77,18 +77,18 @@ def create_test_file(path: Path, content: str = "test content") -> Path:
 
 
 class TestCacheEntryContentHash:
-    """Tests for content_hash in CacheEntry."""
+    """Tests for cid in CacheEntry."""
 
-    def test_put_computes_content_hash(self, cache, temp_dir):
-        """put() should compute and store content_hash."""
+    def test_put_computes_cid(self, cache, temp_dir):
+        """put() should compute and store cid."""
         test_file = create_test_file(temp_dir / "input.txt", "hello world")
 
         cache.put("node1", test_file, "test")
         entry = cache.get_entry("node1")
 
         assert entry is not None
-        assert entry.content_hash != ""
-        assert len(entry.content_hash) == 64  # SHA-3-256 hex
+        assert entry.cid != ""
+        assert len(entry.cid) == 64  # SHA-3-256 hex
 
     def test_same_content_same_hash(self, cache, temp_dir):
         """Same file content should produce same hash."""
@@ -101,7 +101,7 @@ class TestCacheEntryContentHash:
         entry1 = cache.get_entry("node1")
         entry2 = cache.get_entry("node2")
 
-        assert entry1.content_hash == entry2.content_hash
+        assert entry1.cid == entry2.cid
 
     def test_different_content_different_hash(self, cache, temp_dir):
         """Different file content should produce different hash."""
@@ -114,31 +114,31 @@ class TestCacheEntryContentHash:
         entry1 = cache.get_entry("node1")
         entry2 = cache.get_entry("node2")
 
-        assert entry1.content_hash != entry2.content_hash
+        assert entry1.cid != entry2.cid
 
-    def test_find_by_content_hash(self, cache, temp_dir):
+    def test_find_by_cid(self, cache, temp_dir):
         """Should find entry by content hash."""
         test_file = create_test_file(temp_dir / "input.txt", "unique content")
         cache.put("node1", test_file, "test")
 
         entry = cache.get_entry("node1")
-        found = cache.find_by_content_hash(entry.content_hash)
+        found = cache.find_by_cid(entry.cid)
 
         assert found is not None
         assert found.node_id == "node1"
 
-    def test_content_hash_persists(self, temp_dir):
-        """content_hash should persist across cache reloads."""
+    def test_cid_persists(self, temp_dir):
+        """cid should persist across cache reloads."""
         cache1 = Cache(temp_dir / "cache")
         test_file = create_test_file(temp_dir / "input.txt", "persistent")
         cache1.put("node1", test_file, "test")
-        original_hash = cache1.get_entry("node1").content_hash
+        original_hash = cache1.get_entry("node1").cid
 
         # Create new cache instance (reload from disk)
         cache2 = Cache(temp_dir / "cache")
         entry = cache2.get_entry("node1")
 
-        assert entry.content_hash == original_hash
+        assert entry.cid == original_hash
 
 
 class TestActivity:
@@ -344,7 +344,7 @@ class TestActivityManager:
 
         # Mark as shared
         entry = cache.get_entry("shared_node")
-        ap_store.mark_shared(entry.content_hash)
+        ap_store.mark_shared(entry.cid)
 
         assert manager.can_delete_cache_entry("shared_node") is False
 
@@ -425,7 +425,7 @@ class TestActivityManager:
 
         # Mark output as shared
         entry = cache.get_entry("o1")
-        ap_store.mark_shared(entry.content_hash)
+        ap_store.mark_shared(entry.cid)
 
         assert manager.can_discard_activity("a1") is False
 
@@ -444,7 +444,7 @@ class TestActivityManager:
         activity_store.add(activity)
 
         entry = cache.get_entry("i1")
-        ap_store.mark_shared(entry.content_hash)
+        ap_store.mark_shared(entry.cid)
 
         assert manager.can_discard_activity("a1") is False
 
@@ -508,7 +508,7 @@ class TestActivityManager:
         activity_store.add(activity)
 
         entry = cache.get_entry("o1")
-        ap_store.mark_shared(entry.content_hash)
+        ap_store.mark_shared(entry.cid)
 
         result = manager.discard_activity("a1")
 

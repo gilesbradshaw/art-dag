@@ -377,10 +377,10 @@ def cmd_run_recipe(args):
 
             # Handle SOURCE specially
             if step.node_type == "SOURCE":
-                content_hash = step.config.get("content_hash")
-                if content_hash in cache_paths:
-                    cache_paths[step.cache_id] = cache_paths[content_hash]
-                    cache_paths[step.step_id] = cache_paths[content_hash]
+                cid = step.config.get("cid")
+                if cid in cache_paths:
+                    cache_paths[step.cache_id] = cache_paths[cid]
+                    cache_paths[step.step_id] = cache_paths[cid]
                     print(f"  [SOURCE] {step.step_id}")
                     continue
 

@@ -264,14 +264,14 @@ class PlanScheduler:
         """Check if a cache_id exists in cache."""
         if self.cache_manager is None:
             return False
-        path = self.cache_manager.get_by_content_hash(cache_id)
+        path = self.cache_manager.get_by_cid(cache_id)
         return path is not None
 
     def _get_cached_path(self, cache_id: str) -> Optional[str]:
         """Get the path for a cached item."""
         if self.cache_manager is None:
             return None
-        path = self.cache_manager.get_by_content_hash(cache_id)
+        path = self.cache_manager.get_by_cid(cache_id)
         return str(path) if path else None
 
     def _get_execute_task(self):

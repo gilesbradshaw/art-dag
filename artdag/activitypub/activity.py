@@ -96,7 +96,7 @@ class CreateActivity(Activity):
         cls,
         actor: Actor,
         asset_name: str,
-        content_hash: str,
+        cid: str,
         asset_type: str = "Image",
         metadata: Dict[str, Any] = None,
     ) -> "CreateActivity":
@@ -106,7 +106,7 @@ class CreateActivity(Activity):
         Args:
             actor: The actor claiming ownership
             asset_name: Name of the asset
-            content_hash: SHA-3 hash of the asset content
+            cid: SHA-3 hash of the asset content
             asset_type: ActivityPub object type (Image, Video, Audio, etc.)
             metadata: Additional metadata
 
@@ -116,10 +116,10 @@ class CreateActivity(Activity):
         object_data = {
             "type": asset_type,
             "name": asset_name,
-            "id": f"https://{DOMAIN}/objects/{content_hash}",
+            "id": f"https://{DOMAIN}/objects/{cid}",
             "contentHash": {
                 "algorithm": "sha3-256",
-                "value": content_hash,
+                "value": cid,
             },
             "attributedTo": actor.id,
         }
@@ -188,14 +188,14 @@ class ActivityStore:
         """Find activities by actor."""
         return [a for a in self._activities if a.actor_id == actor_id]
 
-    def find_by_object_hash(self, content_hash: str) -> List[Activity]:
+    def find_by_object_hash(self, cid: str) -> List[Activity]:
         """Find activities referencing an object by hash."""
         results = []
         for a in self._activities:
             obj_hash = a.object_data.get("contentHash", {})
-            if isinstance(obj_hash, dict) and obj_hash.get("value") == content_hash:
+            if isinstance(obj_hash, dict) and obj_hash.get("value") == cid:
                 results.append(a)
-            elif a.object_data.get("contentHash") == content_hash:
+            elif a.object_data.get("contentHash") == cid:
                 results.append(a)
         return results
 

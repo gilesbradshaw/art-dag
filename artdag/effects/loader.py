@@ -24,7 +24,7 @@ class LoadedEffect:
 
     Attributes:
         source: Original source code
-        content_hash: SHA3-256 hash of source
+        cid: SHA3-256 hash of source
         meta: Extracted EffectMeta
         dependencies: List of pip dependencies
         requires_python: Python version requirement
@@ -32,7 +32,7 @@ class LoadedEffect:
     """
 
     source: str
-    content_hash: str
+    cid: str
     meta: EffectMeta
     dependencies: List[str] = field(default_factory=list)
     requires_python: str = ">=3.10"
@@ -47,7 +47,7 @@ class LoadedEffect:
         return self.meta.api_type == "video"
 
 
-def compute_content_hash(source: str) -> str:
+def compute_cid(source: str) -> str:
     """Compute SHA3-256 hash of effect source."""
     return hashlib.sha3_256(source.encode("utf-8")).hexdigest()
 
@@ -333,7 +333,7 @@ def load_effect(source: str) -> LoadedEffect:
     Raises:
         ValueError: If effect is invalid
     """
-    content_hash = compute_content_hash(source)
+    cid = compute_cid(source)
 
     # Parse PEP 723 metadata
     dependencies, requires_python = parse_pep723_metadata(source)
@@ -431,7 +431,7 @@ def load_effect(source: str) -> LoadedEffect:
 
     return LoadedEffect(
         source=source,
-        content_hash=content_hash,
+        cid=cid,
         meta=meta,
         dependencies=dependencies,
         requires_python=requires_python,

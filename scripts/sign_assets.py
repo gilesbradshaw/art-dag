@@ -34,7 +34,7 @@ def sign_data(private_key, data: str) -> str:
     return base64.b64encode(signature).decode()
 
 
-def create_activity(actor_id: str, asset_name: str, content_hash: str, asset_type: str, domain: str = "artdag.rose-ash.com"):
+def create_activity(actor_id: str, asset_name: str, cid: str, asset_type: str, domain: str = "artdag.rose-ash.com"):
     """Create a Create activity for an asset."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -45,10 +45,10 @@ def create_activity(actor_id: str, asset_name: str, content_hash: str, asset_typ
         "object_data": {
             "type": asset_type_to_ap(asset_type),
             "name": asset_name,
-            "id": f"https://{domain}/objects/{content_hash}",
+            "id": f"https://{domain}/objects/{cid}",
             "contentHash": {
                 "algorithm": "sha3-256",
-                "value": content_hash
+                "value": cid
             },
             "attributedTo": actor_id
         },
@@ -110,12 +110,12 @@ def main():
 
     for asset_name, asset_data in registry["assets"].items():
         print(f"\nSigning: {asset_name}")
-        print(f"  Hash: {asset_data['content_hash'][:16]}...")
+        print(f"  Hash: {asset_data['cid'][:16]}...")
 
         activity = create_activity(
             actor_id=actor_id,
             asset_name=asset_name,
-            content_hash=asset_data["content_hash"],
+            cid=asset_data["cid"],
             asset_type=asset_data["asset_type"],
             domain=domain,
         )

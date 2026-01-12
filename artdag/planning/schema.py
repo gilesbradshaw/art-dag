@@ -307,19 +307,19 @@ class PlanInput:
     Attributes:
         name: Human-readable name from recipe (e.g., "source_video")
         cache_id: Content hash of the input file
-        content_hash: Same as cache_id (for clarity)
+        cid: Same as cache_id (for clarity)
         media_type: MIME type of the input
     """
     name: str
     cache_id: str
-    content_hash: str
+    cid: str
     media_type: str = "application/octet-stream"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "cache_id": self.cache_id,
-            "content_hash": self.content_hash,
+            "cid": self.cid,
             "media_type": self.media_type,
         }
 
@@ -328,7 +328,7 @@ class PlanInput:
         return cls(
             name=data["name"],
             cache_id=data["cache_id"],
-            content_hash=data.get("content_hash", data["cache_id"]),
+            cid=data.get("cid", data["cache_id"]),
             media_type=data.get("media_type", "application/octet-stream"),
         )
 

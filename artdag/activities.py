@@ -37,10 +37,10 @@ def make_is_shared_fn(activitypub_store: "ActivityStore") -> Callable[[str], boo
             (from artdag.activitypub.activity)
 
     Returns:
-        Function that checks if a content_hash has been published
+        Function that checks if a cid has been published
     """
-    def is_shared(content_hash: str) -> bool:
-        activities = activitypub_store.find_by_object_hash(content_hash)
+    def is_shared(cid: str) -> bool:
+        activities = activitypub_store.find_by_object_hash(cid)
         return any(a.activity_type == "Create" for a in activities)
     return is_shared
 
@@ -226,7 +226,7 @@ class ActivityManager:
         Args:
             cache: The L1 cache
             activity_store: Activity persistence
-            is_shared_fn: Function that checks if a content_hash is shared
+            is_shared_fn: Function that checks if a cid is shared
                           (published via ActivityPub)
         """
         self.cache = cache
@@ -242,9 +242,9 @@ class ActivityManager:
     def is_shared(self, node_id: str) -> bool:
         """Check if a cache entry is shared (published via ActivityPub)."""
         entry = self.cache.get_entry(node_id)
-        if not entry or not entry.content_hash:
+        if not entry or not entry.cid:
             return False
-        return self._is_shared(entry.content_hash)
+        return self._is_shared(entry.cid)
 
     def can_delete_cache_entry(self, node_id: str) -> bool:
         """
