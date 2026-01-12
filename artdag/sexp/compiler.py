@@ -216,6 +216,10 @@ def _compile_expr(expr: Any, ctx: CompilerContext) -> Optional[str]:
     if name == "analyze":
         return _compile_analyze(expr, ctx)
 
+    # Binding expression for parameter linking
+    if name == "bind":
+        return _compile_bind(expr, ctx)
+
     raise CompileError(f"Unknown expression type: {name}")
 
 
@@ -432,7 +436,13 @@ def _compile_source(expr: List, ctx: CompilerContext) -> str:
 
 
 def _compile_effect_node(expr: List, ctx: CompilerContext) -> str:
-    """Compile (effect effect-name [input-node])."""
+    """
+    Compile (effect effect-name [input-node] :param value ...).
+
+    Parameters can be literals or bind expressions:
+        (fx brightness :level 0.5)
+        (fx brightness :level (bind analysis :energy :range [0 1]))
+    """
     args, kwargs = _parse_kwargs(expr, 1)
     args, kwargs, prev_id = _extract_prev_id(args, kwargs)
 
@@ -444,7 +454,11 @@ def _compile_effect_node(expr: List, ctx: CompilerContext) -> str:
         effect_name = effect_name.name
 
     config = {"effect": effect_name}
-    config.update({k: v for k, v in kwargs.items() if k not in ("hash", "url")})
+
+    # Process parameter values, looking for bind expressions
+    for k, v in kwargs.items():
+        if k not in ("hash", "url"):
+            config[k] = _process_value(v, ctx)
 
     inputs = []
     if prev_id:
@@ -616,6 +630,93 @@ def _compile_analyze(expr: List, ctx: CompilerContext) -> str:
         inputs.append(_resolve_input(arg, ctx, prev_id))
 
     return ctx.add_node("ANALYZE", config, inputs)
+
+
+def _compile_bind(expr: List, ctx: CompilerContext) -> Dict[str, Any]:
+    """
+    Compile (bind source feature :option value ...).
+
+    Returns a binding specification dict (not a node ID).
+
+    Examples:
+        (bind analysis :energy)
+        (bind analysis :energy :range [0 1])
+        (bind analysis :beats :on-event 1.0 :decay 0.1)
+        (bind analysis :energy :range [0 1] :smooth 0.05 :noise 0.1 :seed 42)
+    """
+    args, kwargs = _parse_kwargs(expr, 1)
+
+    if len(args) < 2:
+        raise CompileError("bind requires source and feature: (bind source :feature ...)")
+
+    source = args[0]
+    feature = args[1]
+
+    # Source can be a symbol reference
+    source_ref = None
+    if isinstance(source, Symbol):
+        if source.name in ctx.bindings:
+            source_ref = ctx.bindings[source.name]
+        else:
+            source_ref = source.name
+
+    # Feature should be a keyword
+    feature_name = None
+    if isinstance(feature, Keyword):
+        feature_name = feature.name
+    elif isinstance(feature, Symbol):
+        feature_name = feature.name
+    else:
+        raise CompileError(f"bind feature must be a keyword, got {feature}")
+
+    binding = {
+        "_binding": True,  # Marker for binding resolution
+        "source": source_ref,
+        "feature": feature_name,
+    }
+
+    # Add optional binding modifiers
+    if "range" in kwargs:
+        range_val = kwargs["range"]
+        if isinstance(range_val, list) and len(range_val) == 2:
+            binding["range"] = [float(range_val[0]), float(range_val[1])]
+        else:
+            raise CompileError("bind :range must be [lo hi]")
+
+    if "smooth" in kwargs:
+        binding["smooth"] = float(kwargs["smooth"])
+
+    if "offset" in kwargs:
+        binding["offset"] = float(kwargs["offset"])
+
+    if "on-event" in kwargs:
+        binding["on_event"] = float(kwargs["on-event"])
+
+    if "decay" in kwargs:
+        binding["decay"] = float(kwargs["decay"])
+
+    if "noise" in kwargs:
+        binding["noise"] = float(kwargs["noise"])
+
+    if "seed" in kwargs:
+        binding["seed"] = int(kwargs["seed"])
+
+    return binding
+
+
+def _process_value(value: Any, ctx: CompilerContext) -> Any:
+    """
+    Process a value, resolving nested expressions like bind.
+
+    Returns the processed value (could be a binding dict, node ref, or literal).
+    """
+    if isinstance(value, list) and len(value) > 0:
+        head = value[0]
+        if isinstance(head, Symbol) and head.name == "bind":
+            return _compile_bind(value, ctx)
+        # Could be other nested expressions
+        return _compile_expr(value, ctx)
+    return value
 
 
 def compile_string(text: str) -> CompiledRecipe:

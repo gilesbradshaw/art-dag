@@ -337,3 +337,138 @@ class Cache:
         node_dir = self._node_dir(node_id)
         node_dir.mkdir(parents=True, exist_ok=True)
         return node_dir / f"output{extension}"
+
+    # Effect storage methods
+
+    def _effects_dir(self) -> Path:
+        """Get the effects subdirectory."""
+        effects_dir = self.cache_dir / "_effects"
+        effects_dir.mkdir(parents=True, exist_ok=True)
+        return effects_dir
+
+    def store_effect(self, source: str) -> str:
+        """
+        Store an effect in the cache.
+
+        Args:
+            source: Effect source code
+
+        Returns:
+            Content hash (cache ID) of the effect
+        """
+        from .effects.loader import load_effect
+
+        loaded = load_effect(source)
+        content_hash = loaded.content_hash
+
+        effect_dir = self._effects_dir() / content_hash
+        effect_dir.mkdir(parents=True, exist_ok=True)
+
+        # Store source
+        source_path = effect_dir / "effect.py"
+        source_path.write_text(source, encoding="utf-8")
+
+        # Store metadata
+        metadata = {
+            "content_hash": content_hash,
+            "meta": loaded.meta.to_dict(),
+            "dependencies": loaded.dependencies,
+            "requires_python": loaded.requires_python,
+            "stored_at": time.time(),
+        }
+        metadata_path = effect_dir / "metadata.json"
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        logger.info(f"Stored effect '{loaded.meta.name}' with hash {content_hash[:16]}...")
+        return content_hash
+
+    def get_effect(self, content_hash: str) -> Optional[str]:
+        """
+        Get effect source by content hash.
+
+        Args:
+            content_hash: SHA3-256 hash of effect source
+
+        Returns:
+            Effect source code if found, None otherwise
+        """
+        effect_dir = self._effects_dir() / content_hash
+        source_path = effect_dir / "effect.py"
+
+        if not source_path.exists():
+            return None
+
+        return source_path.read_text(encoding="utf-8")
+
+    def get_effect_path(self, content_hash: str) -> Optional[Path]:
+        """
+        Get path to effect source file.
+
+        Args:
+            content_hash: SHA3-256 hash of effect source
+
+        Returns:
+            Path to effect.py if found, None otherwise
+        """
+        effect_dir = self._effects_dir() / content_hash
+        source_path = effect_dir / "effect.py"
+
+        if not source_path.exists():
+            return None
+
+        return source_path
+
+    def get_effect_metadata(self, content_hash: str) -> Optional[dict]:
+        """
+        Get effect metadata by content hash.
+
+        Args:
+            content_hash: SHA3-256 hash of effect source
+
+        Returns:
+            Metadata dict if found, None otherwise
+        """
+        effect_dir = self._effects_dir() / content_hash
+        metadata_path = effect_dir / "metadata.json"
+
+        if not metadata_path.exists():
+            return None
+
+        try:
+            with open(metadata_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, KeyError):
+            return None
+
+    def has_effect(self, content_hash: str) -> bool:
+        """Check if an effect is cached."""
+        effect_dir = self._effects_dir() / content_hash
+        return (effect_dir / "effect.py").exists()
+
+    def list_effects(self) -> List[dict]:
+        """List all cached effects with their metadata."""
+        effects = []
+        effects_dir = self._effects_dir()
+
+        if not effects_dir.exists():
+            return effects
+
+        for effect_dir in effects_dir.iterdir():
+            if effect_dir.is_dir():
+                metadata = self.get_effect_metadata(effect_dir.name)
+                if metadata:
+                    effects.append(metadata)
+
+        return effects
+
+    def remove_effect(self, content_hash: str) -> bool:
+        """Remove an effect from the cache."""
+        effect_dir = self._effects_dir() / content_hash
+
+        if not effect_dir.exists():
+            return False
+
+        shutil.rmtree(effect_dir)
+        logger.info(f"Removed effect {content_hash[:16]}...")
+        return True
