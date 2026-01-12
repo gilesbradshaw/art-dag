@@ -12,6 +12,7 @@ Effects can be:
 import importlib.util
 import logging
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -23,8 +24,36 @@ from ..executor import Executor, register_executor
 
 logger = logging.getLogger(__name__)
 
-# IPFS gateway for fetching effects
-IPFS_GATEWAY = os.environ.get("IPFS_GATEWAY", "http://127.0.0.1:8080")
+# IPFS API multiaddr - same as ipfs_client.py for consistency
+# Docker uses /dns/ipfs/tcp/5001, local dev uses /ip4/127.0.0.1/tcp/5001
+IPFS_API = os.environ.get("IPFS_API", "/ip4/127.0.0.1/tcp/5001")
+
+# Connection timeout in seconds
+IPFS_TIMEOUT = int(os.environ.get("IPFS_TIMEOUT", "30"))
+
+
+def _get_ipfs_base_url() -> str:
+    """
+    Convert IPFS multiaddr to HTTP URL.
+
+    Matches the conversion logic in ipfs_client.py for consistency.
+    """
+    multiaddr = IPFS_API
+
+    # Handle /dns/hostname/tcp/port format (Docker)
+    dns_match = re.match(r"/dns[46]?/([^/]+)/tcp/(\d+)", multiaddr)
+    if dns_match:
+        return f"http://{dns_match.group(1)}:{dns_match.group(2)}"
+
+    # Handle /ip4/address/tcp/port format (local)
+    ip4_match = re.match(r"/ip4/([^/]+)/tcp/(\d+)", multiaddr)
+    if ip4_match:
+        return f"http://{ip4_match.group(1)}:{ip4_match.group(2)}"
+
+    # Fallback: assume it's already a URL or use default
+    if multiaddr.startswith("http"):
+        return multiaddr
+    return "http://127.0.0.1:5001"
 
 
 def _get_effects_cache_dir() -> Optional[Path]:
@@ -50,12 +79,18 @@ def _fetch_effect_from_ipfs(cid: str, effect_path: Path) -> bool:
     """
     Fetch an effect from IPFS and cache locally.
 
+    Uses the IPFS API endpoint (/api/v0/cat) for consistency with ipfs_client.py.
+    This works reliably in Docker where IPFS_API=/dns/ipfs/tcp/5001.
+
     Returns True on success, False on failure.
     """
     try:
-        # Try IPFS gateway
-        url = f"{IPFS_GATEWAY}/ipfs/{cid}"
-        response = requests.get(url, timeout=30)
+        # Use IPFS API (same as ipfs_client.py)
+        base_url = _get_ipfs_base_url()
+        url = f"{base_url}/api/v0/cat"
+        params = {"arg": cid}
+
+        response = requests.post(url, params=params, timeout=IPFS_TIMEOUT)
         response.raise_for_status()
 
         # Cache locally
