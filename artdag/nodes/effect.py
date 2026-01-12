@@ -111,6 +111,78 @@ def _fetch_effect_from_ipfs(cid: str, effect_path: Path) -> bool:
         return False
 
 
+def _parse_pep723_dependencies(source: str) -> List[str]:
+    """
+    Parse PEP 723 dependencies from effect source code.
+
+    Returns list of package names (e.g., ["numpy", "opencv-python"]).
+    """
+    match = re.search(r"# /// script\n(.*?)# ///", source, re.DOTALL)
+    if not match:
+        return []
+
+    block = match.group(1)
+    deps_match = re.search(r'# dependencies = \[(.*?)\]', block, re.DOTALL)
+    if not deps_match:
+        return []
+
+    return re.findall(r'"([^"]+)"', deps_match.group(1))
+
+
+def _ensure_dependencies(dependencies: List[str], effect_cid: str) -> bool:
+    """
+    Ensure effect dependencies are installed.
+
+    Installs missing packages using pip. Returns True on success.
+    """
+    if not dependencies:
+        return True
+
+    missing = []
+    for dep in dependencies:
+        # Extract package name (strip version specifiers)
+        pkg_name = re.split(r'[<>=!]', dep)[0].strip()
+        # Normalize name (pip uses underscores, imports use underscores or hyphens)
+        pkg_name_normalized = pkg_name.replace('-', '_').lower()
+
+        try:
+            __import__(pkg_name_normalized)
+        except ImportError:
+            # Some packages have different import names
+            try:
+                # Try original name with hyphens replaced
+                __import__(pkg_name.replace('-', '_'))
+            except ImportError:
+                missing.append(dep)
+
+    if not missing:
+        return True
+
+    logger.info(f"Installing effect dependencies for {effect_cid[:16]}...: {missing}")
+
+    try:
+        import subprocess
+        import sys
+
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        if result.returncode != 0:
+            logger.error(f"Failed to install dependencies: {result.stderr}")
+            return False
+
+        logger.info(f"Installed dependencies: {missing}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error installing dependencies: {e}")
+        return False
+
+
 def _load_cached_effect(effect_cid: str) -> Optional[EffectFn]:
     """
     Load an effect by CID, fetching from IPFS if not cached locally.
@@ -140,6 +212,19 @@ def _load_cached_effect(effect_cid: str) -> Optional[EffectFn]:
         if not _fetch_effect_from_ipfs(effect_cid, effect_path):
             logger.warning(f"Effect not found: {effect_cid[:16]}...")
             return None
+
+    # Parse and install dependencies before loading
+    try:
+        source = effect_path.read_text()
+        dependencies = _parse_pep723_dependencies(source)
+        if dependencies:
+            logger.info(f"Effect {effect_cid[:16]}... requires: {dependencies}")
+            if not _ensure_dependencies(dependencies, effect_cid):
+                logger.error(f"Failed to install dependencies for effect {effect_cid[:16]}...")
+                return None
+    except Exception as e:
+        logger.error(f"Error parsing effect dependencies: {e}")
+        # Continue anyway - the effect might work without the deps check
 
     # Load the effect module
     try:

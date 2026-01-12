@@ -159,6 +159,52 @@ class TestEffectFetchURL:
 class TestEffectDependencies:
     """Tests for effect dependency handling."""
 
+    def test_parse_pep723_dependencies(self) -> None:
+        """Should parse PEP 723 dependencies from effect source."""
+        source = '''
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["numpy", "opencv-python"]
+# ///
+"""
+@effect test_effect
+"""
+
+def process_frame(frame, params, state):
+    return frame, state
+'''
+        # Import the function after the fix is applied
+        from artdag.nodes.effect import _parse_pep723_dependencies
+
+        deps = _parse_pep723_dependencies(source)
+
+        assert deps == ["numpy", "opencv-python"]
+
+    def test_parse_pep723_no_dependencies(self) -> None:
+        """Should return empty list if no dependencies block."""
+        source = '''
+"""
+@effect simple_effect
+"""
+
+def process_frame(frame, params, state):
+    return frame, state
+'''
+        from artdag.nodes.effect import _parse_pep723_dependencies
+
+        deps = _parse_pep723_dependencies(source)
+
+        assert deps == []
+
+    def test_ensure_dependencies_already_installed(self) -> None:
+        """Should return True if dependencies are already installed."""
+        from artdag.nodes.effect import _ensure_dependencies
+
+        # os is always available
+        result = _ensure_dependencies(["os"], "QmTest123")
+
+        assert result is True
+
     def test_effect_with_missing_dependency_gives_clear_error(self, tmp_path: Path) -> None:
         """
         Regression test: Missing dependencies should give clear error message.
