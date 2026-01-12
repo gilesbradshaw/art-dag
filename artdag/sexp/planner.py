@@ -20,6 +20,13 @@ from .parser import Symbol, Keyword, serialize
 from .compiler import CompiledRecipe
 
 
+# Node types that can be collapsed into a single FFmpeg filter chain
+COLLAPSIBLE_TYPES = {"EFFECT", "TRANSFORM", "RESIZE", "SEGMENT"}
+
+# Node types that are boundaries (sources, merges, or special processing)
+BOUNDARY_TYPES = {"SOURCE", "SEQUENCE", "LAYER", "BLEND", "MUX", "ANALYZE"}
+
+
 def _stable_hash(data: Any, cluster_key: str = None) -> str:
     """Create stable SHA3-256 hash from data."""
     if cluster_key:
@@ -105,6 +112,190 @@ class ExecutionPlanSexp:
         return serialize(self.to_sexp(), pretty=pretty)
 
 
+def _collapse_effect_chains(nodes: List[Dict], registry: Dict = None) -> List[Dict]:
+    """
+    Collapse sequential effect chains into single COMPOUND nodes.
+
+    A chain is a sequence of single-input collapsible nodes where:
+    - Each node has exactly one input
+    - No node in the chain is referenced by multiple other nodes
+    - The chain ends at a boundary or multi-ref node
+    - No node in the chain is marked as temporal
+
+    Effects can declare :temporal true to prevent collapsing (e.g., reverse).
+
+    Returns a new node list with chains collapsed.
+    """
+    if not nodes:
+        return nodes
+
+    registry = registry or {}
+    nodes_by_id = {n["id"]: n for n in nodes}
+
+    # Build reference counts: how many nodes reference each node as input
+    ref_count = {n["id"]: 0 for n in nodes}
+    for node in nodes:
+        for inp in node.get("inputs", []):
+            if inp in ref_count:
+                ref_count[inp] += 1
+
+    # Track which nodes are consumed by chains
+    consumed = set()
+    compound_nodes = []
+
+    def is_temporal(node: Dict) -> bool:
+        """Check if a node is temporal (needs complete input)."""
+        config = node.get("config", {})
+        # Check node-level temporal flag
+        if config.get("temporal"):
+            return True
+        # Check effect registry for temporal flag
+        if node["type"] == "EFFECT":
+            effect_name = config.get("effect")
+            if effect_name:
+                effect_meta = registry.get("effects", {}).get(effect_name, {})
+                if effect_meta.get("temporal"):
+                    return True
+        return False
+
+    def is_collapsible(node_id: str) -> bool:
+        """Check if a node can be part of a chain."""
+        if node_id in consumed:
+            return False
+        node = nodes_by_id.get(node_id)
+        if not node:
+            return False
+        if node["type"] not in COLLAPSIBLE_TYPES:
+            return False
+        # Temporal effects can't be collapsed
+        if is_temporal(node):
+            return False
+        return True
+
+    def is_chain_boundary(node_id: str) -> bool:
+        """Check if a node is a chain boundary (can't be collapsed into)."""
+        node = nodes_by_id.get(node_id)
+        if not node:
+            return True  # Unknown node is a boundary
+        # Boundary if: it's a boundary type, or referenced by multiple nodes
+        return node["type"] in BOUNDARY_TYPES or ref_count.get(node_id, 0) > 1
+
+    def collect_chain(start_id: str) -> List[str]:
+        """Collect a chain of collapsible nodes starting from start_id."""
+        chain = [start_id]
+        current = start_id
+
+        while True:
+            node = nodes_by_id[current]
+            inputs = node.get("inputs", [])
+
+            # Must have exactly one input
+            if len(inputs) != 1:
+                break
+
+            next_id = inputs[0]
+
+            # Stop if next is a boundary or already consumed
+            if is_chain_boundary(next_id) or not is_collapsible(next_id):
+                break
+
+            # Stop if next is referenced by others besides current
+            if ref_count.get(next_id, 0) > 1:
+                break
+
+            chain.append(next_id)
+            current = next_id
+
+        return chain
+
+    # Process nodes in reverse order (from outputs toward inputs)
+    # This ensures we find complete chains starting from their end
+    # First, topologically sort to get dependency order
+    sorted_ids = []
+    visited = set()
+
+    def topo_visit(node_id: str):
+        if node_id in visited:
+            return
+        visited.add(node_id)
+        node = nodes_by_id.get(node_id)
+        if node:
+            for inp in node.get("inputs", []):
+                topo_visit(inp)
+            sorted_ids.append(node_id)
+
+    for node in nodes:
+        topo_visit(node["id"])
+
+    # Process in reverse topological order (outputs first)
+    result_nodes = []
+
+    for node_id in reversed(sorted_ids):
+        node = nodes_by_id[node_id]
+
+        if node_id in consumed:
+            continue
+
+        if not is_collapsible(node_id):
+            # Keep boundary nodes as-is
+            result_nodes.append(node)
+            continue
+
+        # Check if this node is the start of a chain (output end)
+        # A node is a chain start if it's collapsible and either:
+        # - Referenced by a boundary node
+        # - Referenced by multiple nodes
+        # - Is the output node
+        # For now, collect chain going backwards from this node
+
+        chain = collect_chain(node_id)
+
+        if len(chain) == 1:
+            # Single node, no collapse needed
+            result_nodes.append(node)
+            continue
+
+        # Collapse the chain into a COMPOUND node
+        # Chain is [end, ..., start] order (backwards from output)
+        # The compound node:
+        # - Has the same ID as the chain end (for reference stability)
+        # - Takes input from what the chain start originally took
+        # - Has a filter_chain config with all the nodes in order
+
+        chain_start = chain[-1]  # First to execute
+        chain_end = chain[0]     # Last to execute
+
+        start_node = nodes_by_id[chain_start]
+        end_node = nodes_by_id[chain_end]
+
+        # Build filter chain config (in execution order: start to end)
+        filter_chain = []
+        for chain_node_id in reversed(chain):
+            chain_node = nodes_by_id[chain_node_id]
+            filter_chain.append({
+                "type": chain_node["type"],
+                "config": chain_node.get("config", {}),
+            })
+
+        compound_node = {
+            "id": chain_end,  # Keep the end ID for reference stability
+            "type": "COMPOUND",
+            "config": {
+                "filter_chain": filter_chain,
+            },
+            "inputs": start_node.get("inputs", []),
+            "name": f"compound_{len(filter_chain)}_effects",
+        }
+
+        result_nodes.append(compound_node)
+
+        # Mark all chain nodes as consumed
+        for chain_node_id in chain:
+            consumed.add(chain_node_id)
+
+    return result_nodes
+
+
 def create_plan(
     recipe: CompiledRecipe,
     inputs: Dict[str, str] = None,
@@ -131,11 +322,14 @@ def create_plan(
     # Compute recipe hash
     recipe_hash = _stable_hash(recipe.to_dict(), cluster_key)
 
-    # Build node lookup
-    nodes_by_id = {node["id"]: node for node in recipe.nodes}
+    # Collapse sequential effect chains into compound nodes
+    collapsed_nodes = _collapse_effect_chains(recipe.nodes, recipe.registry)
+
+    # Build node lookup from collapsed nodes
+    nodes_by_id = {node["id"]: node for node in collapsed_nodes}
 
     # Topological sort
-    sorted_ids = _topological_sort(recipe.nodes)
+    sorted_ids = _topological_sort(collapsed_nodes)
 
     # Create steps with resolved hashes
     steps = []
@@ -241,7 +435,19 @@ def _resolve_config(
     resolved = {}
 
     for key, value in config.items():
-        if key == "asset" and isinstance(value, str):
+        if key == "filter_chain" and isinstance(value, list):
+            # Resolve each filter in the chain (for COMPOUND nodes)
+            resolved_chain = []
+            for filter_item in value:
+                filter_config = filter_item.get("config", {})
+                resolved_filter_config = _resolve_config(filter_config, registry, inputs)
+                resolved_chain.append({
+                    "type": filter_item["type"],
+                    "config": resolved_filter_config,
+                })
+            resolved["filter_chain"] = resolved_chain
+
+        elif key == "asset" and isinstance(value, str):
             # Resolve asset reference
             if value in registry.get("assets", {}):
                 resolved["hash"] = registry["assets"][value]["hash"]

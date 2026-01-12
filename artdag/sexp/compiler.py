@@ -283,9 +283,15 @@ def _compile_effect_decl(expr: List, ctx: CompilerContext) -> Optional[str]:
         if isinstance(name, Symbol):
             name = name.name
 
+        # Handle temporal flag - could be Symbol('true') or Python bool
+        temporal = kwargs.get("temporal", False)
+        if isinstance(temporal, Symbol):
+            temporal = temporal.name.lower() == "true"
+
         ctx.registry["effects"][name] = {
             "hash": kwargs["hash"],
             "url": kwargs.get("url"),
+            "temporal": temporal,
         }
         return None
 
