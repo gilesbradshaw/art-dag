@@ -455,11 +455,10 @@ def _resolve_config(
                 resolved["asset"] = value  # Keep as-is if not in registry
 
         elif key == "effect" and isinstance(value, str):
-            # Resolve effect reference
+            # Resolve effect reference - keep name AND add hash
+            resolved["effect"] = value
             if value in registry.get("effects", {}):
                 resolved["hash"] = registry["effects"][value]["hash"]
-            else:
-                resolved["effect"] = value  # Keep as-is if not in registry
 
         elif key == "input" and value is True:
             # Variable input - resolve from inputs dict
