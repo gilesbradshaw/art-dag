@@ -24,11 +24,13 @@ logger = logging.getLogger(__name__)
 
 def _get_effects_cache_dir() -> Optional[Path]:
     """Get the effects cache directory from environment or default."""
-    cache_dir = os.environ.get("ARTDAG_CACHE_DIR")
-    if cache_dir:
-        effects_dir = Path(cache_dir) / "_effects"
-        if effects_dir.exists():
-            return effects_dir
+    # Check both env var names (CACHE_DIR used by art-celery, ARTDAG_CACHE_DIR for standalone)
+    for env_var in ["CACHE_DIR", "ARTDAG_CACHE_DIR"]:
+        cache_dir = os.environ.get(env_var)
+        if cache_dir:
+            effects_dir = Path(cache_dir) / "_effects"
+            if effects_dir.exists():
+                return effects_dir
 
     # Try default locations
     for base in [Path.home() / ".artdag" / "cache", Path("/var/cache/artdag")]:
