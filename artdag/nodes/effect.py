@@ -1,12 +1,12 @@
 # artdag/nodes/effect.py
 """
-Effect executor: Apply effects from the registry or cache.
+Effect executor: Apply effects from the registry or IPFS.
 
 Primitives: EFFECT
 
 Effects can be:
 1. Built-in (registered with @register_effect)
-2. Cached (referenced by content hash)
+2. Stored in IPFS (referenced by CID)
 """
 
 import importlib.util
@@ -17,9 +17,14 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import requests
+
 from ..executor import Executor, register_executor
 
 logger = logging.getLogger(__name__)
+
+# IPFS gateway for fetching effects
+IPFS_GATEWAY = os.environ.get("IPFS_GATEWAY", "http://127.0.0.1:8080")
 
 
 def _get_effects_cache_dir() -> Optional[Path]:
@@ -41,21 +46,58 @@ def _get_effects_cache_dir() -> Optional[Path]:
     return None
 
 
-def _load_cached_effect(effect_hash: str) -> Optional[callable]:
+def _fetch_effect_from_ipfs(cid: str, effect_path: Path) -> bool:
     """
-    Load a cached effect by content hash.
+    Fetch an effect from IPFS and cache locally.
+
+    Returns True on success, False on failure.
+    """
+    try:
+        # Try IPFS gateway
+        url = f"{IPFS_GATEWAY}/ipfs/{cid}"
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+
+        # Cache locally
+        effect_path.parent.mkdir(parents=True, exist_ok=True)
+        effect_path.write_bytes(response.content)
+        logger.info(f"Fetched effect from IPFS: {cid[:16]}...")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to fetch effect from IPFS {cid[:16]}...: {e}")
+        return False
+
+
+def _load_cached_effect(effect_cid: str) -> Optional[callable]:
+    """
+    Load an effect by CID, fetching from IPFS if not cached locally.
 
     Returns the effect function or None if not found.
     """
     effects_dir = _get_effects_cache_dir()
-    if not effects_dir:
-        logger.warning("Effects cache directory not found")
-        return None
 
-    effect_path = effects_dir / effect_hash / "effect.py"
+    # Create cache dir if needed
+    if not effects_dir:
+        # Try to create default cache dir
+        for env_var in ["CACHE_DIR", "ARTDAG_CACHE_DIR"]:
+            cache_dir = os.environ.get(env_var)
+            if cache_dir:
+                effects_dir = Path(cache_dir) / "_effects"
+                effects_dir.mkdir(parents=True, exist_ok=True)
+                break
+
+        if not effects_dir:
+            effects_dir = Path.home() / ".artdag" / "cache" / "_effects"
+            effects_dir.mkdir(parents=True, exist_ok=True)
+
+    effect_path = effects_dir / effect_cid / "effect.py"
+
+    # If not cached locally, fetch from IPFS
     if not effect_path.exists():
-        logger.warning(f"Cached effect not found: {effect_hash[:16]}...")
-        return None
+        if not _fetch_effect_from_ipfs(effect_cid, effect_path):
+            logger.warning(f"Effect not found: {effect_cid[:16]}...")
+            return None
 
     # Load the effect module
     try:
@@ -75,11 +117,11 @@ def _load_cached_effect(effect_hash: str) -> Optional[callable]:
         if hasattr(module, "effect"):
             return module.effect
 
-        logger.warning(f"Cached effect has no recognized API: {effect_hash[:16]}...")
+        logger.warning(f"Effect has no recognized API: {effect_cid[:16]}...")
         return None
 
     except Exception as e:
-        logger.error(f"Failed to load cached effect {effect_hash[:16]}...: {e}")
+        logger.error(f"Failed to load effect {effect_cid[:16]}...: {e}")
         return None
 
 
@@ -193,11 +235,12 @@ def effect_identity(input_path: Path, output_path: Path, config: Dict[str, Any])
 @register_executor("EFFECT")
 class EffectExecutor(Executor):
     """
-    Apply an effect from the registry or cache.
+    Apply an effect from the registry or IPFS.
 
     Config:
         effect: Name of the effect to apply
-        hash: Optional content hash for cached effects
+        cid: IPFS CID for the effect (fetched from IPFS if not cached)
+        hash: Legacy alias for cid (backwards compatibility)
         params: Optional parameters for the effect
 
     Inputs:
@@ -211,7 +254,8 @@ class EffectExecutor(Executor):
         output_path: Path,
     ) -> Path:
         effect_name = config.get("effect")
-        effect_hash = config.get("hash")
+        # Support both "cid" (new) and "hash" (legacy)
+        effect_cid = config.get("cid") or config.get("hash")
 
         if not effect_name:
             raise ValueError("EFFECT requires 'effect' config")
@@ -219,12 +263,12 @@ class EffectExecutor(Executor):
         if len(inputs) != 1:
             raise ValueError(f"EFFECT expects 1 input, got {len(inputs)}")
 
-        # Try cached effect first if hash provided
+        # Try IPFS effect first if CID provided
         effect_fn = None
-        if effect_hash:
-            effect_fn = _load_cached_effect(effect_hash)
+        if effect_cid:
+            effect_fn = _load_cached_effect(effect_cid)
             if effect_fn:
-                logger.info(f"Running cached effect '{effect_name}' ({effect_hash[:16]}...)")
+                logger.info(f"Running effect '{effect_name}' (cid={effect_cid[:16]}...)")
 
         # Fall back to built-in effect
         if effect_fn is None:
@@ -241,7 +285,8 @@ class EffectExecutor(Executor):
         if "effect" not in config:
             errors.append("EFFECT requires 'effect' config")
         else:
-            # If hash provided, we'll load from cache - skip built-in check
-            if not config.get("hash") and get_effect(config["effect"]) is None:
+            # If CID provided, we'll load from IPFS - skip built-in check
+            has_cid = config.get("cid") or config.get("hash")
+            if not has_cid and get_effect(config["effect"]) is None:
                 errors.append(f"Unknown effect: {config['effect']}")
         return errors

@@ -272,16 +272,19 @@ def _compile_effect_decl(expr: List, ctx: CompilerContext) -> Optional[str]:
     """
     Compile effect - either declaration or node.
 
-    Declaration: (effect name :hash "..." :url "...")
+    Declaration: (effect name :cid "..." :url "...") or legacy (effect name :hash "...")
     Node: (effect effect-name) or (effect effect-name input-node)
     """
     if len(expr) < 2:
         raise CompileError("effect requires at least a name")
 
-    # Check if this is a declaration (has :hash)
+    # Check if this is a declaration (has :cid or :hash)
     _, kwargs = _parse_kwargs(expr, 2)
 
-    if "hash" in kwargs:
+    # Support both :cid (new) and :hash (legacy)
+    effect_cid = kwargs.get("cid") or kwargs.get("hash")
+
+    if effect_cid:
         # Declaration
         name = expr[1]
         if isinstance(name, Symbol):
@@ -293,7 +296,7 @@ def _compile_effect_decl(expr: List, ctx: CompilerContext) -> Optional[str]:
             temporal = temporal.name.lower() == "true"
 
         ctx.registry["effects"][name] = {
-            "hash": kwargs["hash"],
+            "cid": effect_cid,
             "url": kwargs.get("url"),
             "temporal": temporal,
         }
