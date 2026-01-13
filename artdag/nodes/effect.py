@@ -359,52 +359,6 @@ def effect_identity(input_path: Path, output_path: Path, config: Dict[str, Any])
     return actual_output
 
 
-@register_effect("invert")
-def effect_invert(input_path: Path, output_path: Path, config: Dict[str, Any]) -> Path:
-    """
-    Invert effect - negates colors in the video.
-
-    Uses FFmpeg's negate filter.
-
-    Config:
-        intensity: Blend factor 0.0-1.0 (1.0 = full invert, 0.0 = no change)
-    """
-    import subprocess
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Preserve extension from input
-    actual_output = output_path.with_suffix(input_path.suffix or ".mkv")
-
-    intensity = config.get("intensity", 1.0)
-
-    # Build filter - negate with optional blend to original
-    if intensity >= 1.0:
-        vf = "negate"
-    elif intensity <= 0.0:
-        vf = "null"
-    else:
-        # Blend between original and inverted
-        vf = f"split[a][b];[a]negate[inv];[b][inv]blend=all_expr='A*{1-intensity}+B*{intensity}'"
-
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_path),
-        "-vf", vf,
-        "-c:a", "copy",
-        str(actual_output),
-    ]
-
-    logger.debug(f"EFFECT invert: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        logger.error(f"FFmpeg invert error: {result.stderr}")
-        raise RuntimeError(f"Invert effect failed: {result.stderr}")
-
-    logger.info(f"EFFECT invert: {input_path.name} -> {actual_output} (intensity={intensity})")
-    return actual_output
-
-
 @register_executor("EFFECT")
 class EffectExecutor(Executor):
     """
