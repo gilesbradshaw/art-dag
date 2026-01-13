@@ -9,10 +9,11 @@ Supports:
 - Numbers: 42, 3.14, -1.5
 - Comments: ; to end of line
 - Vectors: [a b c] (syntactic sugar for lists)
+- Maps: {:key1 val1 :key2 val2} (parsed as Python dicts)
 """
 
 from dataclasses import dataclass
-from typing import Any, List, Union
+from typing import Any, Dict, List, Union
 import re
 
 
@@ -123,8 +124,8 @@ class Tokenizer:
         char = self.text[self.pos]
         start_line, start_col = self.line, self.col
 
-        # Single-character tokens
-        if char in '()[]':
+        # Single-character tokens (parens, brackets, braces)
+        if char in '()[]{}':
             self._advance()
             return char
 
@@ -227,8 +228,12 @@ def _parse_expr(tokenizer: Tokenizer) -> Any:
     if token == '[':
         return _parse_list(tokenizer, ']')
 
+    # Map/dict: {:key1 val1 :key2 val2}
+    if token == '{':
+        return _parse_map(tokenizer)
+
     # Unexpected closers
-    if isinstance(token, str) and token in ')]':
+    if isinstance(token, str) and token in ')]}':
         raise ParseError(f"Unexpected {token!r}", tokenizer.pos, tokenizer.line, tokenizer.col)
 
     # Atom
@@ -251,6 +256,36 @@ def _parse_list(tokenizer: Tokenizer, closer: str) -> List[Any]:
             return items
 
         items.append(_parse_expr(tokenizer))
+
+
+def _parse_map(tokenizer: Tokenizer) -> Dict[str, Any]:
+    """Parse a map/dict: {:key1 val1 :key2 val2} -> {"key1": val1, "key2": val2}."""
+    result = {}
+
+    while True:
+        char = tokenizer.peek()
+
+        if char is None:
+            raise ParseError("Unterminated map, expected '}'",
+                           tokenizer.pos, tokenizer.line, tokenizer.col)
+
+        if char == '}':
+            tokenizer.next_token()  # Consume closer
+            return result
+
+        # Parse key (should be a keyword like :key)
+        key_token = _parse_expr(tokenizer)
+        if isinstance(key_token, Keyword):
+            key = key_token.name
+        elif isinstance(key_token, str):
+            key = key_token
+        else:
+            raise ParseError(f"Map key must be keyword or string, got {type(key_token).__name__}",
+                           tokenizer.pos, tokenizer.line, tokenizer.col)
+
+        # Parse value
+        value = _parse_expr(tokenizer)
+        result[key] = value
 
 
 def serialize(expr: Any, indent: int = 0, pretty: bool = False) -> str:
