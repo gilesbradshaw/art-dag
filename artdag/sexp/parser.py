@@ -53,6 +53,31 @@ class Keyword:
         return hash((':' , self.name))
 
 
+@dataclass
+class Lambda:
+    """A lambda/anonymous function with closure."""
+    params: List[str]  # Parameter names
+    body: Any  # Expression body
+    closure: Dict = None  # Captured environment (optional for backwards compat)
+
+    def __repr__(self):
+        return f"Lambda({self.params}, {self.body!r})"
+
+
+@dataclass
+class Binding:
+    """A binding to analysis data for dynamic effect parameters."""
+    analysis_ref: str  # Name of analysis variable
+    track: str = None  # Optional track name (e.g., "bass", "energy")
+    range_min: float = 0.0  # Output range minimum
+    range_max: float = 1.0  # Output range maximum
+    transform: str = None  # Optional transform: "sqrt", "pow2", "log", etc.
+
+    def __repr__(self):
+        t = f", transform={self.transform!r}" if self.transform else ""
+        return f"Binding({self.analysis_ref!r}, track={self.track!r}, range=[{self.range_min}, {self.range_max}]{t})"
+
+
 class ParseError(Exception):
     """Error during S-expression parsing."""
     def __init__(self, message: str, position: int = 0, line: int = 1, col: int = 1):
@@ -233,7 +258,7 @@ def _parse_expr(tokenizer: Tokenizer) -> Any:
         return _parse_map(tokenizer)
 
     # Unexpected closers
-    if isinstance(token, str) and token in ')]}':
+    if token in (')', ']', '}'):
         raise ParseError(f"Unexpected {token!r}", tokenizer.pos, tokenizer.line, tokenizer.col)
 
     # Atom
@@ -315,6 +340,22 @@ def serialize(expr: Any, indent: int = 0, pretty: bool = False) -> str:
 
     if isinstance(expr, Keyword):
         return f":{expr.name}"
+
+    if isinstance(expr, Lambda):
+        params = " ".join(expr.params)
+        body = serialize(expr.body, indent, pretty)
+        return f"(fn [{params}] {body})"
+
+    if isinstance(expr, Binding):
+        # analysis_ref can be a string, node ID, or dict - serialize it properly
+        if isinstance(expr.analysis_ref, str):
+            ref_str = f'"{expr.analysis_ref}"'
+        else:
+            ref_str = serialize(expr.analysis_ref, indent, pretty)
+        s = f"(bind {ref_str} :range [{expr.range_min} {expr.range_max}]"
+        if expr.transform:
+            s += f" :transform {expr.transform}"
+        return s + ")"
 
     if isinstance(expr, str):
         # Escape special characters

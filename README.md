@@ -17,6 +17,33 @@ Content-addressed DAG execution engine with ActivityPub ownership.
 pip install -e .
 ```
 
+### Optional: External Effect Tools
+
+Some effects can use external tools for better performance:
+
+**Pixelsort** (glitch art pixel sorting):
+```bash
+# Rust CLI (recommended - fast)
+cargo install --git https://github.com/Void-ux/pixelsort.git pixelsort
+
+# Or Python CLI
+pip install git+https://github.com/Blotz/pixelsort-cli
+```
+
+**Datamosh** (video glitch/corruption):
+```bash
+# FFglitch (recommended)
+./scripts/install-ffglitch.sh
+
+# Or Python CLI
+pip install git+https://github.com/tiberiuiancu/datamoshing
+```
+
+Check available tools:
+```bash
+python -m artdag.sexp.external_tools
+```
+
 ## Quick Start
 
 ```python
