@@ -53,6 +53,29 @@ class CompileError(Exception):
 
 
 @dataclass
+class ParamDef:
+    """Definition of a recipe parameter."""
+    name: str
+    param_type: str  # "string", "int", "float", "bool"
+    default: Any
+    description: str = ""
+    range_min: Optional[float] = None
+    range_max: Optional[float] = None
+    choices: Optional[List[str]] = None  # For enum-like params
+
+
+@dataclass
+class CompiledStage:
+    """A compiled stage with dependencies and outputs."""
+    name: str
+    requires: List[str]  # Names of required stages
+    inputs: List[str]  # Names of bindings consumed from required stages
+    outputs: List[str]  # Names of bindings produced by this stage
+    node_ids: List[str]  # Node IDs created in this stage
+    output_bindings: Dict[str, str]  # output_name -> node_id mapping
+
+
+@dataclass
 class CompiledRecipe:
     """Result of compiling an S-expression recipe."""
     name: str
@@ -64,6 +87,9 @@ class CompiledRecipe:
     output_node_id: str
     encoding: Dict[str, Any] = field(default_factory=dict)  # {codec, crf, preset, audio_codec}
     metadata: Dict[str, Any] = field(default_factory=dict)
+    params: List[ParamDef] = field(default_factory=list)  # Declared parameters
+    stages: List[CompiledStage] = field(default_factory=list)  # Compiled stages
+    stage_order: List[str] = field(default_factory=list)  # Topologically sorted stage names
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary format (compatible with YAML structure)."""
@@ -88,6 +114,13 @@ class CompilerContext:
     registry: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {"assets": {}, "effects": {}, "analyzers": {}, "constructs": {}})
     bindings: Dict[str, str] = field(default_factory=dict)  # name -> node_id
     nodes: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # node_id -> node
+
+    # Stage tracking
+    current_stage: Optional[str] = None  # Name of stage currently being compiled
+    defined_stages: Dict[str, 'CompiledStage'] = field(default_factory=dict)  # stage_name -> CompiledStage
+    stage_bindings: Dict[str, Dict[str, str]] = field(default_factory=dict)  # stage_name -> {binding_name -> node_id}
+    pre_stage_bindings: Dict[str, Any] = field(default_factory=dict)  # bindings defined before any stage
+    stage_node_ids: List[str] = field(default_factory=list)  # node IDs created in current stage
 
     def add_node(self, node_type: str, config: Dict[str, Any],
                  inputs: List[str] = None, name: str = None) -> str:
@@ -123,7 +156,85 @@ class CompilerContext:
             "inputs": inputs or [],
             "name": name,
         }
+
+        # Track node in current stage
+        if self.current_stage is not None:
+            self.stage_node_ids.append(node_id)
+
         return node_id
+
+    def get_accessible_bindings(self, stage_inputs: List[str] = None) -> Dict[str, Any]:
+        """
+        Get bindings accessible to the current stage.
+
+        If inside a stage with declared inputs, only those inputs plus pre-stage
+        bindings are accessible. If outside a stage, all bindings are accessible.
+        """
+        if self.current_stage is None:
+            return dict(self.bindings)
+
+        # Start with pre-stage bindings (sources, etc.)
+        accessible = dict(self.pre_stage_bindings)
+
+        # Add declared inputs from required stages
+        if stage_inputs:
+            for input_name in stage_inputs:
+                # Look for the binding in required stages
+                for stage_name, stage in self.defined_stages.items():
+                    if input_name in stage.output_bindings:
+                        accessible[input_name] = stage.output_bindings[input_name]
+                        break
+                else:
+                    # Check if it's in pre-stage bindings (might be a source)
+                    if input_name not in accessible:
+                        raise CompileError(
+                            f"Stage '{self.current_stage}' declares input '{input_name}' "
+                            f"but it's not produced by any required stage"
+                        )
+
+        return accessible
+
+
+def _topological_sort_stages(stages: Dict[str, 'CompiledStage']) -> List[str]:
+    """
+    Topologically sort stages by their dependencies.
+
+    Returns list of stage names in execution order (dependencies first).
+    """
+    if not stages:
+        return []
+
+    # Build dependency graph
+    in_degree = {name: 0 for name in stages}
+    dependents = {name: [] for name in stages}
+
+    for name, stage in stages.items():
+        for req in stage.requires:
+            if req in stages:
+                dependents[req].append(name)
+                in_degree[name] += 1
+
+    # Kahn's algorithm
+    queue = [name for name, degree in in_degree.items() if degree == 0]
+    result = []
+
+    while queue:
+        # Sort for deterministic ordering
+        queue.sort()
+        current = queue.pop(0)
+        result.append(current)
+
+        for dependent in dependents[current]:
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                queue.append(dependent)
+
+    if len(result) != len(stages):
+        # This shouldn't happen if we validated cycles earlier
+        missing = set(stages.keys()) - set(result)
+        raise CompileError(f"Circular stage dependency detected: {missing}")
+
+    return result
 
 
 def _parse_encoding(value: Any) -> Dict[str, Any]:
@@ -150,6 +261,106 @@ def _parse_encoding(value: Any) -> Dict[str, Any]:
         else:
             raise CompileError(f"Expected keyword in encoding, got {type(item).__name__}")
     return result
+
+
+def _parse_params(value: Any) -> List[ParamDef]:
+    """
+    Parse parameter definitions from S-expression.
+
+    Syntax:
+        :params (
+          (param_name :type string :default "value" :desc "Description")
+          (param_name :type float :default 1.0 :range [0 10] :desc "Description")
+          (param_name :type string :default "a" :choices ["a" "b" "c"] :desc "Description")
+        )
+
+    Supported types: string, int, float, bool
+    Optional: :range [min max], :choices [...], :desc "..."
+    """
+    if not isinstance(value, list):
+        raise CompileError(f"Params must be a list, got {type(value).__name__}")
+
+    params = []
+    for param_def in value:
+        if not isinstance(param_def, list) or len(param_def) < 1:
+            raise CompileError(f"Invalid param definition: {param_def}")
+
+        # First element is the parameter name
+        first = param_def[0]
+        if isinstance(first, Symbol):
+            param_name = first.name
+        elif isinstance(first, str):
+            param_name = first
+        else:
+            raise CompileError(f"Param name must be symbol or string, got {type(first).__name__}")
+
+        # Parse keyword arguments
+        param_type = "string"
+        default = None
+        desc = ""
+        range_min = None
+        range_max = None
+        choices = None
+
+        i = 1
+        while i < len(param_def):
+            item = param_def[i]
+            if isinstance(item, Keyword):
+                if i + 1 >= len(param_def):
+                    raise CompileError(f"Param keyword {item.name} missing value")
+                kw_value = param_def[i + 1]
+
+                if item.name == "type":
+                    if isinstance(kw_value, Symbol):
+                        param_type = kw_value.name
+                    else:
+                        param_type = str(kw_value)
+                elif item.name == "default":
+                    default = kw_value
+                elif item.name == "desc" or item.name == "description":
+                    desc = str(kw_value)
+                elif item.name == "range":
+                    if isinstance(kw_value, list) and len(kw_value) >= 2:
+                        range_min = float(kw_value[0])
+                        range_max = float(kw_value[1])
+                    else:
+                        raise CompileError(f"Param range must be [min max], got {kw_value}")
+                elif item.name == "choices":
+                    if isinstance(kw_value, list):
+                        choices = [str(c) if not isinstance(c, Symbol) else c.name for c in kw_value]
+                    else:
+                        raise CompileError(f"Param choices must be a list, got {kw_value}")
+                else:
+                    raise CompileError(f"Unknown param keyword :{item.name}")
+                i += 2
+            else:
+                i += 1
+
+        # Convert default to appropriate type
+        if default is not None:
+            if param_type == "int":
+                default = int(default)
+            elif param_type == "float":
+                default = float(default)
+            elif param_type == "bool":
+                if isinstance(default, (int, float)):
+                    default = bool(default)
+                elif isinstance(default, str):
+                    default = default.lower() in ("true", "1", "yes")
+            elif param_type == "string":
+                default = str(default)
+
+        params.append(ParamDef(
+            name=param_name,
+            param_type=param_type,
+            default=default,
+            description=desc,
+            range_min=range_min,
+            range_max=range_max,
+            choices=choices,
+        ))
+
+    return params
 
 
 def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> CompiledRecipe:
@@ -185,14 +396,11 @@ def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> Compil
     # Parse keyword arguments and body
     ctx = CompilerContext()
 
-    # Inject initial bindings if provided
-    if initial_bindings:
-        for k, v in initial_bindings.items():
-            ctx.bindings[k] = v
     version = "1.0"
     description = ""
     owner = None
     encoding = {}
+    params = []
     body_exprs = []
 
     i = 2
@@ -212,6 +420,8 @@ def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> Compil
                 owner = str(value)
             elif item.name == "encoding":
                 encoding = _parse_encoding(value)
+            elif item.name == "params":
+                params = _parse_params(value)
             else:
                 raise CompileError(f"Unknown keyword :{item.name}")
             i += 2
@@ -220,15 +430,51 @@ def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> Compil
             body_exprs.append(item)
             i += 1
 
+    # Create bindings from params with their default values
+    # Initial bindings override param defaults
+    for param in params:
+        if initial_bindings and param.name in initial_bindings:
+            ctx.bindings[param.name] = initial_bindings[param.name]
+        else:
+            ctx.bindings[param.name] = param.default
+
+    # Inject any additional initial bindings not covered by params
+    if initial_bindings:
+        for k, v in initial_bindings.items():
+            if k not in ctx.bindings:
+                ctx.bindings[k] = v
+
     # Compile body expressions
+    # Track when we encounter the first stage to capture pre-stage bindings
     output_node_id = None
+    first_stage_seen = False
+
     for expr in body_exprs:
+        # Check if this is a stage form
+        is_stage_form = (
+            isinstance(expr, list) and
+            len(expr) > 0 and
+            isinstance(expr[0], Symbol) and
+            expr[0].name == "stage"
+        )
+
+        # Before the first stage, capture bindings as pre-stage bindings
+        if is_stage_form and not first_stage_seen:
+            first_stage_seen = True
+            ctx.pre_stage_bindings = dict(ctx.bindings)
+
         result = _compile_expr(expr, ctx)
         if result is not None:
             output_node_id = result
 
     if output_node_id is None:
         raise CompileError("Recipe has no output (no DAG expression)")
+
+    # Build stage order (topological sort)
+    stage_order = _topological_sort_stages(ctx.defined_stages)
+
+    # Collect stages in order
+    stages = [ctx.defined_stages[name] for name in stage_order]
 
     return CompiledRecipe(
         name=name,
@@ -239,6 +485,9 @@ def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> Compil
         nodes=list(ctx.nodes.values()),
         output_node_id=output_node_id,
         encoding=encoding,
+        params=params,
+        stages=stages,
+        stage_order=stage_order,
     )
 
 
@@ -285,6 +534,10 @@ def _compile_expr(expr: Any, ctx: CompilerContext) -> Optional[str]:
     # Binding
     if name == "def":
         return _compile_def(expr, ctx)
+
+    # Stage form
+    if name == "stage":
+        return _compile_stage(expr, ctx)
 
     # Threading macro
     if name == "->":
@@ -821,6 +1074,210 @@ def _compile_def(expr: List, ctx: CompilerContext) -> None:
         ctx.nodes[node_id]["name"] = name.name
 
     return None
+
+
+def _compile_stage(expr: List, ctx: CompilerContext) -> Optional[str]:
+    """
+    Compile (stage :name :requires [...] :inputs [...] :outputs [...] body...).
+
+    Stage form enables explicit dependency declaration, parallel execution,
+    and variable scoping.
+
+    Example:
+        (stage :analyze-a
+          :outputs [beats-a]
+          (def beats-a (-> audio-a (analyze beats))))
+
+        (stage :plan-a
+          :requires [:analyze-a]
+          :inputs [beats-a]
+          :outputs [segments-a]
+          (def segments-a (make-segments :beats beats-a)))
+    """
+    if len(expr) < 2:
+        raise CompileError("stage requires at least a name")
+
+    # Parse stage name (first element after 'stage' should be a keyword like :analyze-a)
+    # The stage name is NOT a key-value pair - it's a standalone keyword
+    stage_name = None
+    start_idx = 1
+
+    if len(expr) > 1:
+        first_arg = expr[1]
+        if isinstance(first_arg, Keyword):
+            stage_name = first_arg.name
+            start_idx = 2
+        elif isinstance(first_arg, Symbol):
+            stage_name = first_arg.name
+            start_idx = 2
+
+    if stage_name is None:
+        raise CompileError("stage requires a name (e.g., (stage :analyze-a ...))")
+
+    # Now parse remaining kwargs and body
+    args, kwargs = _parse_kwargs(expr, start_idx)
+
+    # Parse requires, inputs, outputs
+    requires = []
+    if "requires" in kwargs:
+        req_val = kwargs["requires"]
+        if isinstance(req_val, list):
+            for r in req_val:
+                if isinstance(r, Keyword):
+                    requires.append(r.name)
+                elif isinstance(r, Symbol):
+                    requires.append(r.name)
+                elif isinstance(r, str):
+                    requires.append(r)
+                else:
+                    raise CompileError(f"Invalid require: {r}")
+        else:
+            raise CompileError(":requires must be a list")
+
+    inputs = []
+    if "inputs" in kwargs:
+        inp_val = kwargs["inputs"]
+        if isinstance(inp_val, list):
+            for i in inp_val:
+                if isinstance(i, Symbol):
+                    inputs.append(i.name)
+                elif isinstance(i, str):
+                    inputs.append(i)
+                else:
+                    raise CompileError(f"Invalid input: {i}")
+        else:
+            raise CompileError(":inputs must be a list")
+
+    outputs = []
+    if "outputs" in kwargs:
+        out_val = kwargs["outputs"]
+        if isinstance(out_val, list):
+            for o in out_val:
+                if isinstance(o, Symbol):
+                    outputs.append(o.name)
+                elif isinstance(o, str):
+                    outputs.append(o)
+                else:
+                    raise CompileError(f"Invalid output: {o}")
+        else:
+            raise CompileError(":outputs must be a list")
+
+    # Validate requires - must reference defined stages
+    for req in requires:
+        if req not in ctx.defined_stages:
+            raise CompileError(
+                f"Stage '{stage_name}' requires undefined stage '{req}'"
+            )
+
+    # Validate inputs - must be produced by required stages
+    for inp in inputs:
+        found = False
+        for req in requires:
+            if inp in ctx.defined_stages[req].output_bindings:
+                found = True
+                break
+        if not found and inp not in ctx.pre_stage_bindings:
+            raise CompileError(
+                f"Stage '{stage_name}' declares input '{inp}' "
+                f"which is not an output of any required stage or pre-stage binding"
+            )
+
+    # Check for circular dependencies (simple check for now)
+    # A more thorough check would use topological sort
+    visited = set()
+    def check_cycle(stage: str, path: List[str]):
+        if stage in path:
+            cycle = " -> ".join(path + [stage])
+            raise CompileError(f"Circular stage dependency: {cycle}")
+        if stage in visited:
+            return
+        visited.add(stage)
+        if stage in ctx.defined_stages:
+            for req in ctx.defined_stages[stage].requires:
+                check_cycle(req, path + [stage])
+
+    for req in requires:
+        check_cycle(req, [stage_name])
+
+    # Save context state before entering stage
+    prev_stage = ctx.current_stage
+    prev_stage_node_ids = ctx.stage_node_ids
+
+    # Enter stage context
+    ctx.current_stage = stage_name
+    ctx.stage_node_ids = []
+
+    # Build accessible bindings for this stage
+    stage_ctx_bindings = dict(ctx.pre_stage_bindings)
+
+    # Add input bindings from required stages
+    for inp in inputs:
+        for req in requires:
+            if inp in ctx.defined_stages[req].output_bindings:
+                stage_ctx_bindings[inp] = ctx.defined_stages[req].output_bindings[inp]
+                break
+
+    # Save current bindings and set up stage bindings
+    prev_bindings = ctx.bindings
+    ctx.bindings = stage_ctx_bindings
+
+    # Compile body expressions
+    # Body expressions are lists or symbols after the stage name and kwargs
+    # Start from index 2 (after 'stage' and stage name)
+    body_exprs = []
+    i = 2  # Skip 'stage' and stage name
+    while i < len(expr):
+        item = expr[i]
+        if isinstance(item, Keyword):
+            # Skip keyword and its value
+            i += 2
+        elif isinstance(item, (list, Symbol)):
+            # Include both list expressions and symbol references
+            body_exprs.append(item)
+            i += 1
+        else:
+            i += 1
+
+    last_result = None
+    for body_expr in body_exprs:
+        result = _compile_expr(body_expr, ctx)
+        if result is not None:
+            last_result = result
+
+    # Collect output bindings
+    output_bindings = {}
+    for out in outputs:
+        if out in ctx.bindings:
+            output_bindings[out] = ctx.bindings[out]
+        else:
+            raise CompileError(
+                f"Stage '{stage_name}' declares output '{out}' "
+                f"but it was not defined in the stage body"
+            )
+
+    # Create CompiledStage
+    compiled_stage = CompiledStage(
+        name=stage_name,
+        requires=requires,
+        inputs=inputs,
+        outputs=outputs,
+        node_ids=ctx.stage_node_ids,
+        output_bindings=output_bindings,
+    )
+
+    # Register the stage
+    ctx.defined_stages[stage_name] = compiled_stage
+    ctx.stage_bindings[stage_name] = output_bindings
+
+    # Restore context state
+    ctx.current_stage = prev_stage
+    ctx.stage_node_ids = prev_stage_node_ids
+    ctx.bindings = prev_bindings
+
+    # Make stage outputs available to subsequent stages via bindings
+    ctx.bindings.update(output_bindings)
+
+    return last_result
 
 
 def _compile_threading(expr: List, ctx: CompilerContext) -> str:
@@ -1398,6 +1855,9 @@ def _process_value(value: Any, ctx: CompilerContext) -> Any:
         head = value[0]
         if isinstance(head, Symbol) and head.name == "bind":
             return _compile_bind(value, ctx)
+        # Handle lambda expressions - parse but don't compile
+        if isinstance(head, Symbol) and head.name in ("lambda", "fn"):
+            return _parse_lambda(value)
         # Could be other nested expressions
         return _compile_expr(value, ctx)
     return value

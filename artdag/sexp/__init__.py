@@ -21,6 +21,8 @@ from .compiler import (
     compile_string,
     CompiledRecipe,
     CompileError,
+    ParamDef,
+    _parse_params,
 )
 
 from .planner import (
@@ -54,6 +56,8 @@ __all__ = [
     'compile_string',
     'CompiledRecipe',
     'CompileError',
+    'ParamDef',
+    '_parse_params',
     # Planner
     'create_plan',
     'ExecutionPlanSexp',

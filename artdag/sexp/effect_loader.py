@@ -4,6 +4,23 @@ Sexp effect loader.
 Loads sexp effect definitions (define-effect forms) and creates
 frame processors that evaluate the sexp body with primitives.
 
+Effects must use :params syntax:
+
+    (define-effect name
+      :params (
+        (param1 :type int :default 8 :range [4 32] :desc "description")
+        (param2 :type string :default "value" :desc "description")
+      )
+      body)
+
+For effects with no parameters, use empty :params ():
+
+    (define-effect name
+      :params ()
+      body)
+
+Unknown parameters passed to effects will raise an error.
+
 Usage:
     loader = SexpEffectLoader()
     effect_fn = loader.load_effect_file(Path("effects/ascii_art.sexp"))
@@ -12,13 +29,14 @@ Usage:
 
 import logging
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
 from .parser import parse_all, Symbol, Keyword
 from .evaluator import evaluate
 from .primitives import PRIMITIVES
+from .compiler import ParamDef, _parse_params, CompileError
 
 logger = logging.getLogger(__name__)
 
@@ -27,13 +45,19 @@ def _parse_define_effect(sexp) -> tuple:
     """
     Parse a define-effect form.
 
-    (define-effect name
-      ((param1 default1) (param2 default2) ...)
-      body)
+    Required syntax:
+        (define-effect name
+          :params (
+            (param1 :type int :default 8 :range [4 32] :desc "description")
+          )
+          body)
 
-    Returns (name, params_with_defaults, body)
+    Effects MUST use :params syntax. Legacy ((param default) ...) syntax is not supported.
+
+    Returns (name, params_with_defaults, param_defs, body)
+    where param_defs is a list of ParamDef objects
     """
-    if not isinstance(sexp, list) or len(sexp) < 4:
+    if not isinstance(sexp, list) or len(sexp) < 3:
         raise ValueError(f"Invalid define-effect form: {sexp}")
 
     head = sexp[0]
@@ -44,38 +68,68 @@ def _parse_define_effect(sexp) -> tuple:
     if isinstance(name, Symbol):
         name = name.name
 
-    # Parse params with defaults (evaluating default values)
-    params_list = sexp[2]
     params_with_defaults = {}
+    param_defs: List[ParamDef] = []
+    body = None
+    found_params = False
 
-    # Create minimal env for evaluating defaults
-    default_env = {
-        "list": lambda *args: tuple(args),  # (list 0 0 0) -> (0, 0, 0)
-    }
+    # Parse :params and body
+    i = 2
+    while i < len(sexp):
+        item = sexp[i]
+        if isinstance(item, Keyword) and item.name == "params":
+            # :params syntax
+            if i + 1 >= len(sexp):
+                raise ValueError(f"Effect '{name}': Missing params list after :params keyword")
+            try:
+                param_defs = _parse_params(sexp[i + 1])
+                # Build params_with_defaults from ParamDef objects
+                for pd in param_defs:
+                    params_with_defaults[pd.name] = pd.default
+            except CompileError as e:
+                raise ValueError(f"Effect '{name}': Error parsing :params: {e}")
+            found_params = True
+            i += 2
+        elif isinstance(item, Keyword):
+            # Skip other keywords we don't recognize
+            i += 2
+        elif body is None:
+            # First non-keyword item is the body
+            if isinstance(item, list) and item:
+                first_elem = item[0]
+                # Check for legacy syntax and reject it
+                if isinstance(first_elem, list) and len(first_elem) >= 2:
+                    raise ValueError(
+                        f"Effect '{name}': Legacy parameter syntax ((name default) ...) is not supported. "
+                        f"Use :params block instead:\n"
+                        f"  :params (\n"
+                        f"    (param_name :type int :default 0 :desc \"description\")\n"
+                        f"  )"
+                    )
+            body = item
+            i += 1
+        else:
+            i += 1
 
-    if isinstance(params_list, list):
-        for param in params_list:
-            if isinstance(param, list) and len(param) == 2:
-                param_name = param[0].name if isinstance(param[0], Symbol) else param[0]
-                param_default = param[1]
-                # Evaluate default if it's an expression
-                if isinstance(param_default, list) and param_default:
-                    try:
-                        param_default = evaluate(param_default, default_env)
-                    except Exception:
-                        pass  # Keep as-is if eval fails
-                params_with_defaults[param_name] = param_default
-            elif isinstance(param, Symbol):
-                params_with_defaults[param.name] = None
+    if body is None:
+        raise ValueError(f"Effect '{name}': No body found")
 
-    body = sexp[3]
+    if not found_params:
+        raise ValueError(
+            f"Effect '{name}': Missing :params block. Effects must declare parameters.\n"
+            f"For effects with no parameters, use empty :params ():\n"
+            f"  (define-effect {name}\n"
+            f"    :params ()\n"
+            f"    body)"
+        )
 
-    return name, params_with_defaults, body
+    return name, params_with_defaults, param_defs, body
 
 
 def _create_process_frame(
     effect_name: str,
     params_with_defaults: Dict[str, Any],
+    param_defs: List[ParamDef],
     body: Any,
 ) -> Callable:
     """
@@ -108,6 +162,15 @@ def _create_process_frame(
         # Bind frame
         env["frame"] = frame
 
+        # Validate that all provided params are known
+        known_params = set(params_with_defaults.keys())
+        for k in params.keys():
+            if k not in known_params:
+                raise ValueError(
+                    f"Effect '{effect_name}': Unknown parameter '{k}'. "
+                    f"Valid parameters are: {', '.join(sorted(known_params)) if known_params else '(none)'}"
+                )
+
         # Bind parameters (defaults + overrides from config)
         for param_name, default in params_with_defaults.items():
             # Use config value if provided, otherwise default
@@ -115,11 +178,6 @@ def _create_process_frame(
                 env[param_name] = params[param_name]
             elif default is not None:
                 env[param_name] = default
-
-        # Also copy any extra params from config
-        for k, v in params.items():
-            if k not in env:
-                env[k] = v
 
         # Evaluate the body
         try:
@@ -145,7 +203,8 @@ def load_sexp_effect(source: str, base_path: Optional[Path] = None) -> tuple:
         base_path: Base path for resolving relative imports
 
     Returns:
-        (effect_name, process_frame_fn, params_with_defaults)
+        (effect_name, process_frame_fn, params_with_defaults, param_defs)
+        where param_defs is a list of ParamDef objects for introspection
     """
     exprs = parse_all(source)
 
@@ -164,10 +223,10 @@ def load_sexp_effect(source: str, base_path: Optional[Path] = None) -> tuple:
     if not define_effect:
         raise ValueError("No define-effect form found in sexp effect")
 
-    name, params_with_defaults, body = _parse_define_effect(define_effect)
-    process_frame = _create_process_frame(name, params_with_defaults, body)
+    name, params_with_defaults, param_defs, body = _parse_define_effect(define_effect)
+    process_frame = _create_process_frame(name, params_with_defaults, param_defs, body)
 
-    return name, process_frame, params_with_defaults
+    return name, process_frame, params_with_defaults, param_defs
 
 
 def load_sexp_effect_file(path: Path) -> tuple:
@@ -175,7 +234,8 @@ def load_sexp_effect_file(path: Path) -> tuple:
     Load a sexp effect from file.
 
     Returns:
-        (effect_name, process_frame_fn, params_with_defaults)
+        (effect_name, process_frame_fn, params_with_defaults, param_defs)
+        where param_defs is a list of ParamDef objects for introspection
     """
     source = path.read_text()
     return load_sexp_effect(source, base_path=path.parent)
@@ -196,6 +256,8 @@ class SexpEffectLoader:
             recipe_dir: Base directory for resolving relative effect paths
         """
         self.recipe_dir = recipe_dir or Path.cwd()
+        # Cache loaded effects with their param_defs for introspection
+        self._loaded_effects: Dict[str, tuple] = {}
 
     def load_effect_path(self, effect_path: str) -> Callable:
         """
@@ -213,8 +275,11 @@ class SexpEffectLoader:
         if not full_path.exists():
             raise FileNotFoundError(f"Sexp effect not found: {full_path}")
 
-        name, process_frame_fn, params_defaults = load_sexp_effect_file(full_path)
+        name, process_frame_fn, params_defaults, param_defs = load_sexp_effect_file(full_path)
         logger.info(f"Loaded sexp effect: {name} from {effect_path}")
+
+        # Cache for introspection
+        self._loaded_effects[effect_path] = (name, params_defaults, param_defs)
 
         def effect_fn(input_path: Path, output_path: Path, config: Dict[str, Any]) -> Path:
             """Run sexp effect via frame processor."""
@@ -245,6 +310,26 @@ class SexpEffectLoader:
             return actual_output
 
         return effect_fn
+
+    def get_effect_params(self, effect_path: str) -> List[ParamDef]:
+        """
+        Get parameter definitions for an effect.
+
+        Args:
+            effect_path: Relative path to effect .sexp file
+
+        Returns:
+            List of ParamDef objects describing the effect's parameters
+        """
+        if effect_path not in self._loaded_effects:
+            # Load the effect to get its params
+            full_path = self.recipe_dir / effect_path
+            if not full_path.exists():
+                raise FileNotFoundError(f"Sexp effect not found: {full_path}")
+            name, _, params_defaults, param_defs = load_sexp_effect_file(full_path)
+            self._loaded_effects[effect_path] = (name, params_defaults, param_defs)
+
+        return self._loaded_effects[effect_path][2]
 
 
 def get_sexp_effect_loader(recipe_dir: Optional[Path] = None) -> SexpEffectLoader:

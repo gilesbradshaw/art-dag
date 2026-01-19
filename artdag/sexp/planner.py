@@ -156,6 +156,8 @@ class PlanStep:
     inputs: List[str]  # List of input step_ids
     cache_id: str
     level: int = 0
+    stage: Optional[str] = None  # Stage this step belongs to
+    stage_cache_id: Optional[str] = None  # Cache ID for the stage
 
     def to_sexp(self) -> List:
         """Convert to S-expression."""
@@ -167,6 +169,12 @@ class PlanStep:
         # Add level if > 0
         if self.level > 0:
             sexp.extend([Keyword("level"), self.level])
+
+        # Add stage info if present
+        if self.stage:
+            sexp.extend([Keyword("stage"), self.stage])
+        if self.stage_cache_id:
+            sexp.extend([Keyword("stage-cache-id"), self.stage_cache_id])
 
         # Add the node expression
         node_sexp = [Symbol(self.node_type.lower())]
@@ -188,6 +196,17 @@ class PlanStep:
 
 
 @dataclass
+class StagePlan:
+    """A stage in the execution plan with its own cache ID."""
+    stage_name: str
+    cache_id: str
+    steps: List[PlanStep]
+    requires: List[str]  # Names of required stages
+    output_bindings: Dict[str, str]  # binding_name -> cache_id of output
+    level: int = 0  # Stage level for parallel execution
+
+
+@dataclass
 class ExecutionPlanSexp:
     """Execution plan as S-expression."""
     plan_id: str
@@ -198,6 +217,11 @@ class ExecutionPlanSexp:
     inputs: Dict[str, str] = field(default_factory=dict)  # name -> hash
     analysis: Dict[str, Dict] = field(default_factory=dict)  # name -> {times, values}
     metadata: Dict[str, Any] = field(default_factory=dict)
+    stage_plans: List[StagePlan] = field(default_factory=list)  # Stage-level plans
+    stage_order: List[str] = field(default_factory=list)  # Topologically sorted stage names
+    stage_levels: Dict[str, int] = field(default_factory=dict)  # stage_name -> level
+    stage_cache_ids: Dict[str, str] = field(default_factory=dict)  # stage_name -> cache_id
+    effects_registry: Dict[str, Dict] = field(default_factory=dict)  # effect_name -> {path, cid, ...}
 
     def to_sexp(self) -> List:
         """Convert entire plan to S-expression."""
@@ -226,6 +250,37 @@ class ExecutionPlanSexp:
                     track_sexp.extend([Keyword("values"), data["values"]])
                 analysis_sexp.append(track_sexp)
             sexp.append(analysis_sexp)
+
+        # Stage information
+        if self.stage_plans:
+            stages_sexp = [Symbol("stages")]
+            for stage_plan in self.stage_plans:
+                stage_sexp = [
+                    Keyword("name"), stage_plan.stage_name,
+                    Keyword("cache-id"), stage_plan.cache_id,
+                    Keyword("level"), stage_plan.level,
+                ]
+                if stage_plan.requires:
+                    stage_sexp.extend([Keyword("requires"), stage_plan.requires])
+                if stage_plan.output_bindings:
+                    outputs_sexp = []
+                    for name, cache_id in stage_plan.output_bindings.items():
+                        outputs_sexp.append([Symbol(name), Keyword("cache-id"), cache_id])
+                    stage_sexp.extend([Keyword("outputs"), outputs_sexp])
+                stages_sexp.append(stage_sexp)
+            sexp.append(stages_sexp)
+
+        # Effects registry - for loading explicitly declared effects
+        if self.effects_registry:
+            registry_sexp = [Symbol("effects-registry")]
+            for name, info in self.effects_registry.items():
+                effect_sexp = [Symbol(name)]
+                if info.get("path"):
+                    effect_sexp.extend([Keyword("path"), info["path"]])
+                if info.get("cid"):
+                    effect_sexp.extend([Keyword("cid"), info["cid"]])
+                registry_sexp.append(effect_sexp)
+            sexp.append(registry_sexp)
 
         # Steps
         for step in self.steps:
@@ -463,6 +518,8 @@ def _collapse_effect_chains(nodes: List[Dict], registry: Dict = None) -> List[Di
             "type": "COMPOUND",
             "config": {
                 "filter_chain": filter_chain,
+                # Include effects registry so executor can load only declared effects
+                "effects_registry": registry.get("effects", {}),
             },
             "inputs": start_node.get("inputs", []),
             "name": f"compound_{len(filter_chain)}_effects",
@@ -758,6 +815,59 @@ def _expand_slice_on(
     return expanded_nodes
 
 
+def _parse_construct_params(params_list: list) -> tuple:
+    """
+    Parse :params block in a construct definition.
+
+    Syntax:
+        (
+          (param_name :type string :default "value" :desc "description")
+        )
+
+    Returns:
+        (param_names, param_defaults) where param_names is a list of strings
+        and param_defaults is a dict of param_name -> default_value
+    """
+    param_names = []
+    param_defaults = {}
+
+    for param_def in params_list:
+        if not isinstance(param_def, list) or len(param_def) < 1:
+            continue
+
+        # First element is the parameter name
+        first = param_def[0]
+        if isinstance(first, Symbol):
+            param_name = first.name
+        elif isinstance(first, str):
+            param_name = first
+        else:
+            continue
+
+        param_names.append(param_name)
+
+        # Parse keyword arguments
+        default = None
+        i = 1
+        while i < len(param_def):
+            item = param_def[i]
+            if isinstance(item, Keyword):
+                if i + 1 >= len(param_def):
+                    break
+                kw_value = param_def[i + 1]
+
+                if item.name == "default":
+                    default = kw_value
+                # We could also parse :type, :range, :choices, :desc here
+                i += 2
+            else:
+                i += 1
+
+        param_defaults[param_name] = default
+
+    return param_names, param_defaults
+
+
 def _expand_construct(
     node: Dict,
     registry: Dict,
@@ -843,14 +953,58 @@ def _expand_construct(
     # Use local_registry instead of registry from here
     registry = local_registry
 
-    # Parse: (define-construct name "description" (param1 param2) body)
+    # Parse define-construct - requires :params syntax:
+    #   (define-construct name
+    #     :params (
+    #       (param1 :type string :default "value" :desc "description")
+    #     )
+    #     body)
+    #
+    # Legacy syntax (define-construct name "desc" (param1 param2) body) is not supported.
     def_name = construct_def[1].name if isinstance(construct_def[1], Symbol) else construct_def[1]
-    # Skip description string if present
+
+    params = []  # List of param names
+    param_defaults = {}  # param_name -> default value
+    body = None
+    found_params = False
+
     idx = 2
-    if isinstance(construct_def[idx], str):
-        idx += 1
-    params = construct_def[idx]
-    body = construct_def[idx + 1]
+    while idx < len(construct_def):
+        item = construct_def[idx]
+        if isinstance(item, Keyword) and item.name == "params":
+            # :params syntax
+            if idx + 1 >= len(construct_def):
+                raise ValueError(f"Construct '{def_name}': Missing params list after :params keyword")
+            params_list = construct_def[idx + 1]
+            params, param_defaults = _parse_construct_params(params_list)
+            found_params = True
+            idx += 2
+        elif isinstance(item, Keyword):
+            # Skip other keywords (like :desc)
+            idx += 2
+        elif isinstance(item, str):
+            # Skip description strings (but warn about legacy format)
+            print(f"  Warning: Description strings in define-construct are deprecated", file=sys.stderr)
+            idx += 1
+        elif body is None:
+            # First non-keyword, non-string item is the body
+            if isinstance(item, list) and item:
+                first_elem = item[0]
+                # Check for legacy params syntax and reject it
+                if isinstance(first_elem, Symbol) and first_elem.name not in ("let", "let*", "if", "when", "do", "begin", "->", "map", "filter", "fn", "reduce", "nth"):
+                    # Could be legacy params if all items are just symbols
+                    if all(isinstance(p, Symbol) for p in item):
+                        raise ValueError(
+                            f"Construct '{def_name}': Legacy parameter syntax (param1 param2) is not supported. "
+                            f"Use :params block instead."
+                        )
+            body = item
+            idx += 1
+        else:
+            idx += 1
+
+    if body is None:
+        raise ValueError(f"No body found in define-construct {def_name}")
 
     # Build environment with sources and analysis data
     env = dict(sources)
@@ -871,7 +1025,12 @@ def _expand_construct(
                 env[name] = data
         env[analysis_id] = data
 
-    # Bind positional args to params
+    # Apply param defaults first (for :params syntax)
+    for param_name, default_value in param_defaults.items():
+        if default_value is not None:
+            env[param_name] = default_value
+
+    # Bind positional args to params (overrides defaults)
     param_names = [p.name if isinstance(p, Symbol) else p for p in params]
     for i, param in enumerate(param_names):
         if i < len(args):
@@ -899,14 +1058,20 @@ def _expand_construct(
             return [resolve_value(v) for v in val]
         return val
 
-    # Bind keyword arguments from the config (excluding internal keys)
+    # Validate and bind keyword arguments from the config (excluding internal keys)
     # These may be S-expressions that need evaluation (e.g., lambdas)
     # or Symbols that need resolution from bindings
     internal_keys = {"construct_name", "construct_path", "args", "bindings"}
+    known_params = set(param_names) | set(param_defaults.keys())
     for key, value in config.items():
         if key not in internal_keys:
-            # Convert key to valid identifier (replace - with _)
+            # Convert key to valid identifier (replace - with _) for checking
             param_key = key.replace("-", "_")
+            if param_key not in known_params:
+                raise ValueError(
+                    f"Construct '{def_name}': Unknown parameter '{key}'. "
+                    f"Valid parameters are: {', '.join(sorted(known_params)) if known_params else '(none)'}"
+                )
             # Evaluate if it's an expression (list starting with Symbol)
             if isinstance(value, list) and value and isinstance(value[0], Symbol):
                 env[param_key] = evaluate(value, env)
@@ -1298,12 +1463,70 @@ def create_plan(
     # Compute levels
     _compute_levels(steps, nodes_by_id)
 
+    # Handle stage-aware planning if recipe has stages
+    stage_plans = []
+    stage_order = []
+    stage_levels = {}
+    stage_cache_ids = {}
+
+    if recipe.stages:
+        # Build mapping from node_id to stage
+        node_to_stage = {}
+        for stage in recipe.stages:
+            for node_id in stage.node_ids:
+                node_to_stage[node_id] = stage.name
+
+        # Compute stage levels (for parallel execution)
+        stage_levels = _compute_stage_levels(recipe.stages)
+
+        # Compute stage cache IDs
+        # Stage cache ID = hash of: stage_name + required stage cache_ids + node content
+        stage_cache_ids = {}
+        for stage_name in recipe.stage_order:
+            stage = next(s for s in recipe.stages if s.name == stage_name)
+            stage_cache_ids[stage_name] = _compute_stage_cache_id(
+                stage,
+                stage_cache_ids,
+                cache_ids,
+                cluster_key,
+            )
+
+        # Tag each step with stage info
+        for step in steps:
+            if step.step_id in node_to_stage:
+                step.stage = node_to_stage[step.step_id]
+                step.stage_cache_id = stage_cache_ids.get(step.stage)
+
+        # Build stage plans
+        for stage_name in recipe.stage_order:
+            stage = next(s for s in recipe.stages if s.name == stage_name)
+            stage_steps = [s for s in steps if s.stage == stage_name]
+
+            # Build output bindings with cache IDs
+            output_cache_ids = {}
+            for out_name, node_id in stage.output_bindings.items():
+                if node_id in cache_ids:
+                    output_cache_ids[out_name] = cache_ids[node_id]
+
+            stage_plans.append(StagePlan(
+                stage_name=stage_name,
+                cache_id=stage_cache_ids[stage_name],
+                steps=stage_steps,
+                requires=stage.requires,
+                output_bindings=output_cache_ids,
+                level=stage_levels.get(stage_name, 0),
+            ))
+
+        stage_order = recipe.stage_order
+
     # Compute plan ID
     plan_content = {
         "recipe_hash": recipe_hash,
         "steps": [{"id": s.step_id, "cache_id": s.cache_id} for s in steps],
         "inputs": inputs,
     }
+    if stage_cache_ids:
+        plan_content["stage_cache_ids"] = stage_cache_ids
     plan_id = _stable_hash(plan_content, cluster_key)
 
     return ExecutionPlanSexp(
@@ -1314,6 +1537,11 @@ def create_plan(
         output_step_id=recipe.output_node_id,
         inputs=inputs,
         analysis=named_analysis,
+        stage_plans=stage_plans,
+        stage_order=stage_order,
+        stage_levels=stage_levels,
+        stage_cache_ids=stage_cache_ids,
+        effects_registry=recipe.registry.get("effects", {}),
     )
 
 
@@ -1451,6 +1679,61 @@ def _compute_levels(steps: List[PlanStep], nodes_by_id: Dict) -> None:
 
     for step in steps:
         step.level = compute_level(step.step_id)
+
+
+def _compute_stage_levels(stages: List) -> Dict[str, int]:
+    """
+    Compute stage levels for parallel execution.
+
+    Stages at the same level have no dependencies between them
+    and can run in parallel.
+    """
+    from .compiler import CompiledStage
+
+    levels = {}
+
+    def compute_level(stage_name: str) -> int:
+        if stage_name in levels:
+            return levels[stage_name]
+
+        stage = next((s for s in stages if s.name == stage_name), None)
+        if not stage or not stage.requires:
+            levels[stage_name] = 0
+            return 0
+
+        max_req = max(compute_level(req) for req in stage.requires)
+        levels[stage_name] = max_req + 1
+        return levels[stage_name]
+
+    for stage in stages:
+        compute_level(stage.name)
+
+    return levels
+
+
+def _compute_stage_cache_id(
+    stage,
+    stage_cache_ids: Dict[str, str],
+    node_cache_ids: Dict[str, str],
+    cluster_key: str = None,
+) -> str:
+    """
+    Compute cache ID for a stage.
+
+    Stage cache ID = SHA3-256 of:
+    - stage name
+    - required stage cache IDs
+    - node cache IDs in the stage
+    """
+    cache_content = {
+        "stage": stage.name,
+        "requires": {req: stage_cache_ids.get(req, "") for req in stage.requires},
+        "nodes": sorted([
+            node_cache_ids.get(node_id, node_id)
+            for node_id in stage.node_ids
+        ]),
+    }
+    return _stable_hash(cache_content, cluster_key)
 
 
 def step_to_task_sexp(step: PlanStep) -> List:

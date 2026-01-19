@@ -312,6 +312,183 @@ def make_dict(*pairs):
     return result
 
 
+@builtin("keys")
+def keys(d):
+    """Get the keys of a dict as a list."""
+    if not isinstance(d, dict):
+        raise EvalError(f"keys: expected dict, got {type(d).__name__}")
+    return list(d.keys())
+
+
+@builtin("vals")
+def vals(d):
+    """Get the values of a dict as a list."""
+    if not isinstance(d, dict):
+        raise EvalError(f"vals: expected dict, got {type(d).__name__}")
+    return list(d.values())
+
+
+@builtin("merge")
+def merge(*dicts):
+    """Merge multiple dicts, later dicts override earlier."""
+    result = {}
+    for d in dicts:
+        if d is not None:
+            if not isinstance(d, dict):
+                raise EvalError(f"merge: expected dict, got {type(d).__name__}")
+            result.update(d)
+    return result
+
+
+@builtin("assoc")
+def assoc(d, *pairs):
+    """Associate keys with values in a dict: (assoc d :a 1 :b 2)."""
+    if d is None:
+        result = {}
+    elif isinstance(d, dict):
+        result = dict(d)
+    else:
+        raise EvalError(f"assoc: expected dict or nil, got {type(d).__name__}")
+
+    i = 0
+    while i < len(pairs) - 1:
+        key = pairs[i]
+        if isinstance(key, Keyword):
+            key = key.name
+        result[key] = pairs[i + 1]
+        i += 2
+    return result
+
+
+@builtin("dissoc")
+def dissoc(d, *keys_to_remove):
+    """Remove keys from a dict: (dissoc d :a :b)."""
+    if d is None:
+        return {}
+    if not isinstance(d, dict):
+        raise EvalError(f"dissoc: expected dict or nil, got {type(d).__name__}")
+
+    result = dict(d)
+    for key in keys_to_remove:
+        if isinstance(key, Keyword):
+            key = key.name
+        result.pop(key, None)
+    return result
+
+
+@builtin("into")
+def into(target, coll):
+    """Convert a collection into another collection type.
+
+    (into [] {:a 1 :b 2}) -> [["a" 1] ["b" 2]]
+    (into {} [[:a 1] [:b 2]]) -> {"a": 1, "b": 2}
+    (into [] [1 2 3]) -> [1 2 3]
+    """
+    if isinstance(target, list):
+        if isinstance(coll, dict):
+            return [[k, v] for k, v in coll.items()]
+        elif isinstance(coll, (list, tuple)):
+            return list(coll)
+        else:
+            raise EvalError(f"into: cannot convert {type(coll).__name__} into list")
+    elif isinstance(target, dict):
+        if isinstance(coll, dict):
+            return dict(coll)
+        elif isinstance(coll, (list, tuple)):
+            result = {}
+            for item in coll:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    key = item[0]
+                    if isinstance(key, Keyword):
+                        key = key.name
+                    result[key] = item[1]
+                else:
+                    raise EvalError(f"into: expected [key value] pairs, got {item}")
+            return result
+        else:
+            raise EvalError(f"into: cannot convert {type(coll).__name__} into dict")
+    else:
+        raise EvalError(f"into: unsupported target type {type(target).__name__}")
+
+
+@builtin("filter")
+def filter_fn(pred, coll):
+    """Filter collection by predicate. Pred must be a lambda."""
+    if not isinstance(pred, Lambda):
+        raise EvalError(f"filter: expected lambda as predicate, got {type(pred).__name__}")
+
+    result = []
+    for item in coll:
+        # Evaluate predicate with item
+        local_env = {}
+        if pred.closure:
+            local_env.update(pred.closure)
+        local_env[pred.params[0]] = item
+
+        # Inline evaluation of pred.body
+        from . import evaluator
+        if evaluator.evaluate(pred.body, local_env):
+            result.append(item)
+    return result
+
+
+@builtin("some")
+def some(pred, coll):
+    """Return first truthy value of (pred item) for items in coll, or nil."""
+    if not isinstance(pred, Lambda):
+        raise EvalError(f"some: expected lambda as predicate, got {type(pred).__name__}")
+
+    for item in coll:
+        local_env = {}
+        if pred.closure:
+            local_env.update(pred.closure)
+        local_env[pred.params[0]] = item
+
+        from . import evaluator
+        result = evaluator.evaluate(pred.body, local_env)
+        if result:
+            return result
+    return None
+
+
+@builtin("every?")
+def every(pred, coll):
+    """Return true if (pred item) is truthy for all items in coll."""
+    if not isinstance(pred, Lambda):
+        raise EvalError(f"every?: expected lambda as predicate, got {type(pred).__name__}")
+
+    for item in coll:
+        local_env = {}
+        if pred.closure:
+            local_env.update(pred.closure)
+        local_env[pred.params[0]] = item
+
+        from . import evaluator
+        if not evaluator.evaluate(pred.body, local_env):
+            return False
+    return True
+
+
+@builtin("empty?")
+def is_empty(coll):
+    """Return true if collection is empty."""
+    if coll is None:
+        return True
+    return len(coll) == 0
+
+
+@builtin("contains?")
+def contains(coll, key):
+    """Check if collection contains key (for dicts) or element (for lists)."""
+    if isinstance(coll, dict):
+        if isinstance(key, Keyword):
+            key = key.name
+        return key in coll
+    elif isinstance(coll, (list, tuple)):
+        return key in coll
+    return False
+
+
 def evaluate(expr: Any, env: Dict[str, Any] = None) -> Any:
     """
     Evaluate an S-expression in the given environment.
@@ -643,6 +820,23 @@ def evaluate(expr: Any, env: Dict[str, Any] = None) -> Any:
                     local_env[fn.params[1]] = item
                     acc = evaluate(fn.body, local_env)
                 return acc
+
+            # for-each - (for-each fn coll) - iterate with side effects
+            if name == "for-each":
+                if len(expr) != 3:
+                    raise EvalError("for-each requires fn and collection")
+                fn = evaluate(expr[1], env)
+                coll = evaluate(expr[2], env)
+                if not isinstance(fn, Lambda):
+                    raise EvalError(f"for-each requires lambda, got {type(fn)}")
+                for item in coll:
+                    local_env = {}
+                    if fn.closure:
+                        local_env.update(fn.closure)
+                    local_env.update(env)
+                    local_env[fn.params[0]] = item
+                    evaluate(fn.body, local_env)
+                return None
 
         # Function call
         fn = evaluate(head, env)
