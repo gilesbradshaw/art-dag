@@ -222,6 +222,7 @@ class ExecutionPlanSexp:
     stage_levels: Dict[str, int] = field(default_factory=dict)  # stage_name -> level
     stage_cache_ids: Dict[str, str] = field(default_factory=dict)  # stage_name -> cache_id
     effects_registry: Dict[str, Dict] = field(default_factory=dict)  # effect_name -> {path, cid, ...}
+    minimal_primitives: bool = False  # If True, interpreter uses only core primitives
 
     def to_sexp(self) -> List:
         """Convert entire plan to S-expression."""
@@ -281,6 +282,10 @@ class ExecutionPlanSexp:
                     effect_sexp.extend([Keyword("cid"), info["cid"]])
                 registry_sexp.append(effect_sexp)
             sexp.append(registry_sexp)
+
+        # Minimal primitives flag
+        if self.minimal_primitives:
+            sexp.extend([Keyword("minimal-primitives"), True])
 
         # Steps
         for step in self.steps:
@@ -1542,6 +1547,7 @@ def create_plan(
         stage_levels=stage_levels,
         stage_cache_ids=stage_cache_ids,
         effects_registry=recipe.registry.get("effects", {}),
+        minimal_primitives=recipe.minimal_primitives,
     )
 
 

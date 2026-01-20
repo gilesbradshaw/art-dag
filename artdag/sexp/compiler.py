@@ -90,6 +90,7 @@ class CompiledRecipe:
     params: List[ParamDef] = field(default_factory=list)  # Declared parameters
     stages: List[CompiledStage] = field(default_factory=list)  # Compiled stages
     stage_order: List[str] = field(default_factory=list)  # Topologically sorted stage names
+    minimal_primitives: bool = False  # If True, only core primitives available
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary format (compatible with YAML structure)."""
@@ -402,6 +403,7 @@ def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> Compil
     encoding = {}
     params = []
     body_exprs = []
+    minimal_primitives = False
 
     i = 2
     while i < len(sexp):
@@ -422,6 +424,12 @@ def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> Compil
                 encoding = _parse_encoding(value)
             elif item.name == "params":
                 params = _parse_params(value)
+            elif item.name == "minimal-primitives":
+                # Handle boolean value (could be Symbol('true') or Python bool)
+                if isinstance(value, Symbol):
+                    minimal_primitives = value.name.lower() == "true"
+                else:
+                    minimal_primitives = bool(value)
             else:
                 raise CompileError(f"Unknown keyword :{item.name}")
             i += 2
@@ -488,6 +496,7 @@ def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> Compil
         params=params,
         stages=stages,
         stage_order=stage_order,
+        minimal_primitives=minimal_primitives,
     )
 
 
@@ -554,10 +563,8 @@ def _compile_expr(expr: Any, ctx: CompilerContext) -> Optional[str]:
         return _compile_resize(expr, ctx)
     if name == "sequence":
         return _compile_sequence(expr, ctx)
-    if name == "layer":
-        return _compile_layer(expr, ctx)
-    if name == "blend":
-        return _compile_blend(expr, ctx)
+    # Note: layer and blend are now regular effects, not special forms
+    # Use: (effect layer bg fg :x 0 :y 0) or (effect blend a b :mode "overlay")
     if name == "mux":
         return _compile_mux(expr, ctx)
     if name == "analyze":
@@ -1403,11 +1410,18 @@ def _compile_source(expr: List, ctx: CompilerContext) -> str:
 
 def _compile_effect_node(expr: List, ctx: CompilerContext) -> str:
     """
-    Compile (effect effect-name [input-node] :param value ...).
+    Compile (effect effect-name [input-nodes...] :param value ...).
+
+    Single input:
+        (effect rotate video :angle 45)
+        (-> video (effect rotate :angle 45))
+
+    Multi-input (blend, layer, etc.):
+        (effect blend video-a video-b :mode "overlay")
+        (-> video-a (effect blend video-b :mode "overlay"))
 
     Parameters can be literals or bind expressions:
-        (fx brightness :level 0.5)
-        (fx brightness :level (bind analysis :energy :range [0 1]))
+        (effect brightness video :level (bind analysis :energy :range [0 1]))
     """
     args, kwargs = _parse_kwargs(expr, 1)
     args, kwargs, prev_id = _extract_prev_id(args, kwargs)
@@ -1421,16 +1435,35 @@ def _compile_effect_node(expr: List, ctx: CompilerContext) -> str:
 
     config = {"effect": effect_name}
 
+    # Look up effect_path from registry if available
+    effects_registry = ctx.registry.get("effects", {})
+    if effect_name in effects_registry:
+        effect_info = effects_registry[effect_name]
+        if isinstance(effect_info, dict) and "path" in effect_info:
+            config["effect_path"] = effect_info["path"]
+        elif isinstance(effect_info, str):
+            config["effect_path"] = effect_info
+
     # Process parameter values, looking for bind expressions
     for k, v in kwargs.items():
         if k not in ("hash", "url"):
             config[k] = _process_value(v, ctx)
 
+    # Collect inputs - first from threading (prev_id), then from additional args
     inputs = []
     if prev_id:
         inputs.append(prev_id if isinstance(prev_id, str) else str(prev_id))
     for arg in args[1:]:
-        inputs.append(_resolve_input(arg, ctx, prev_id))
+        # Handle list of inputs: (effect blend [video-a video-b] :mode "overlay")
+        if isinstance(arg, list) and arg and not isinstance(arg[0], Symbol):
+            for item in arg:
+                inputs.append(_resolve_input(item, ctx, prev_id))
+        else:
+            inputs.append(_resolve_input(arg, ctx, prev_id))
+
+    # Auto-detect multi-input effects
+    if len(inputs) > 1:
+        config["multi_input"] = True
 
     return ctx.add_node("EFFECT", config, inputs)
 
@@ -1543,68 +1576,6 @@ def _compile_sequence(expr: List, ctx: CompilerContext) -> str:
         inputs.append(_resolve_input(arg, ctx, prev_id))
 
     return ctx.add_node("SEQUENCE", config, inputs)
-
-
-def _compile_layer(expr: List, ctx: CompilerContext) -> str:
-    """
-    Compile (layer bg-node fg-node :x 0 :y 0 :opacity 1.0 :mode "alpha").
-
-    Layer is now a multi-input EFFECT that uses the sexp layer effect.
-    """
-    args, kwargs = _parse_kwargs(expr, 1)
-    args, kwargs, prev_id = _extract_prev_id(args, kwargs)
-
-    inputs = []
-    if prev_id:
-        inputs.append(prev_id if isinstance(prev_id, str) else str(prev_id))
-    for arg in args:
-        inputs.append(_resolve_input(arg, ctx, prev_id))
-
-    if len(inputs) < 2:
-        raise CompileError("layer requires two inputs (background, foreground)")
-
-    # Create EFFECT node with layer effect
-    config = {
-        "effect": "layer",
-        "effect_path": "sexp_effects/effects/layer.sexp",
-        "multi_input": True,
-        "x": kwargs.get("x", 0),
-        "y": kwargs.get("y", 0),
-        "opacity": float(kwargs.get("opacity", 1.0)),
-        "mode": kwargs.get("mode", "alpha"),
-    }
-
-    return ctx.add_node("EFFECT", config, inputs)
-
-
-def _compile_blend(expr: List, ctx: CompilerContext) -> str:
-    """
-    Compile (blend node1 node2 :mode "overlay" :opacity 0.5).
-
-    Blend is now a multi-input EFFECT that uses the sexp blend effect.
-    """
-    args, kwargs = _parse_kwargs(expr, 1)
-    args, kwargs, prev_id = _extract_prev_id(args, kwargs)
-
-    inputs = []
-    if prev_id:
-        inputs.append(prev_id if isinstance(prev_id, str) else str(prev_id))
-    for arg in args:
-        inputs.append(_resolve_input(arg, ctx, prev_id))
-
-    if len(inputs) < 2:
-        raise CompileError("blend requires two inputs")
-
-    # Create EFFECT node with blend effect
-    config = {
-        "effect": "blend",
-        "effect_path": "sexp_effects/effects/blend.sexp",
-        "multi_input": True,
-        "mode": kwargs.get("mode", "overlay"),
-        "opacity": float(kwargs.get("opacity", 0.5)),
-    }
-
-    return ctx.add_node("EFFECT", config, inputs)
 
 
 def _compile_mux(expr: List, ctx: CompilerContext) -> str:
