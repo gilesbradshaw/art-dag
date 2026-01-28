@@ -28,7 +28,7 @@ from .compiler import CompiledRecipe
 COLLAPSIBLE_TYPES = {"EFFECT", "SEGMENT"}
 
 # Node types that are boundaries (sources, merges, or special processing)
-BOUNDARY_TYPES = {"SOURCE", "SEQUENCE", "MUX", "ANALYZE", "LIST"}
+BOUNDARY_TYPES = {"SOURCE", "SEQUENCE", "MUX", "ANALYZE", "SCAN", "LIST"}
 
 # Node types that need expansion during planning
 EXPANDABLE_TYPES = {"SLICE_ON", "CONSTRUCT"}
@@ -157,7 +157,6 @@ class PlanStep:
     cache_id: str
     level: int = 0
     stage: Optional[str] = None  # Stage this step belongs to
-    stage_cache_id: Optional[str] = None  # Cache ID for the stage
 
     def to_sexp(self) -> List:
         """Convert to S-expression."""
@@ -173,8 +172,6 @@ class PlanStep:
         # Add stage info if present
         if self.stage:
             sexp.extend([Keyword("stage"), self.stage])
-        if self.stage_cache_id:
-            sexp.extend([Keyword("stage-cache-id"), self.stage_cache_id])
 
         # Add the node expression
         node_sexp = [Symbol(self.node_type.lower())]
@@ -197,9 +194,8 @@ class PlanStep:
 
 @dataclass
 class StagePlan:
-    """A stage in the execution plan with its own cache ID."""
+    """A stage in the execution plan."""
     stage_name: str
-    cache_id: str
     steps: List[PlanStep]
     requires: List[str]  # Names of required stages
     output_bindings: Dict[str, str]  # binding_name -> cache_id of output
@@ -210,17 +206,17 @@ class StagePlan:
 class ExecutionPlanSexp:
     """Execution plan as S-expression."""
     plan_id: str
-    recipe_id: str
-    recipe_hash: str
     steps: List[PlanStep]
     output_step_id: str
+    source_hash: str = ""  # CID of recipe source
+    params: Dict[str, Any] = field(default_factory=dict)  # Resolved parameter values
+    params_hash: str = ""  # Hash of params for quick comparison
     inputs: Dict[str, str] = field(default_factory=dict)  # name -> hash
     analysis: Dict[str, Dict] = field(default_factory=dict)  # name -> {times, values}
     metadata: Dict[str, Any] = field(default_factory=dict)
     stage_plans: List[StagePlan] = field(default_factory=list)  # Stage-level plans
     stage_order: List[str] = field(default_factory=list)  # Topologically sorted stage names
     stage_levels: Dict[str, int] = field(default_factory=dict)  # stage_name -> level
-    stage_cache_ids: Dict[str, str] = field(default_factory=dict)  # stage_name -> cache_id
     effects_registry: Dict[str, Dict] = field(default_factory=dict)  # effect_name -> {path, cid, ...}
     minimal_primitives: bool = False  # If True, interpreter uses only core primitives
 
@@ -228,10 +224,17 @@ class ExecutionPlanSexp:
         """Convert entire plan to S-expression."""
         sexp = [Symbol("plan")]
 
-        # Metadata
+        # Metadata - purely content-addressed
         sexp.extend([Keyword("id"), self.plan_id])
-        sexp.extend([Keyword("recipe"), self.recipe_id])
-        sexp.extend([Keyword("recipe-hash"), self.recipe_hash])
+        sexp.extend([Keyword("source-cid"), self.source_hash])  # CID of recipe source
+
+        # Parameters
+        if self.params:
+            sexp.extend([Keyword("params-hash"), self.params_hash])
+            params_sexp = [Symbol("params")]
+            for name, value in self.params.items():
+                params_sexp.append([Symbol(name), value])
+            sexp.append(params_sexp)
 
         # Input bindings
         if self.inputs:
@@ -245,10 +248,13 @@ class ExecutionPlanSexp:
             analysis_sexp = [Symbol("analysis")]
             for name, data in self.analysis.items():
                 track_sexp = [Symbol(name)]
-                if "times" in data:
-                    track_sexp.extend([Keyword("times"), data["times"]])
-                if "values" in data:
-                    track_sexp.extend([Keyword("values"), data["values"]])
+                if isinstance(data, dict) and "_cache_id" in data:
+                    track_sexp.extend([Keyword("cache-id"), data["_cache_id"]])
+                else:
+                    if "times" in data:
+                        track_sexp.extend([Keyword("times"), data["times"]])
+                    if "values" in data:
+                        track_sexp.extend([Keyword("values"), data["values"]])
                 analysis_sexp.append(track_sexp)
             sexp.append(analysis_sexp)
 
@@ -258,7 +264,6 @@ class ExecutionPlanSexp:
             for stage_plan in self.stage_plans:
                 stage_sexp = [
                     Keyword("name"), stage_plan.stage_name,
-                    Keyword("cache-id"), stage_plan.cache_id,
                     Keyword("level"), stage_plan.level,
                 ]
                 if stage_plan.requires:
@@ -306,7 +311,9 @@ def _expand_list_inputs(nodes: List[Dict]) -> List[Dict]:
     Expand LIST node inputs in SEQUENCE nodes.
 
     When a SEQUENCE has a LIST as input, replace it with all the LIST's inputs.
-    LIST nodes are virtual and removed from the final node list.
+    LIST nodes that are referenced by non-SEQUENCE nodes (e.g., EFFECT chains)
+    are promoted to SEQUENCE nodes so they produce a concatenated output.
+    Unreferenced LIST nodes are removed.
     """
     nodes_by_id = {n["id"]: n for n in nodes}
     list_nodes = {n["id"]: n for n in nodes if n["type"] == "LIST"}
@@ -314,10 +321,31 @@ def _expand_list_inputs(nodes: List[Dict]) -> List[Dict]:
     if not list_nodes:
         return nodes
 
+    # Determine which LIST nodes are referenced by SEQUENCE vs other node types
+    list_consumed_by_seq = set()
+    list_referenced_by_other = set()
+    for node in nodes:
+        if node["type"] == "LIST":
+            continue
+        for inp in node.get("inputs", []):
+            if inp in list_nodes:
+                if node["type"] == "SEQUENCE":
+                    list_consumed_by_seq.add(inp)
+                else:
+                    list_referenced_by_other.add(inp)
+
     result = []
     for node in nodes:
         if node["type"] == "LIST":
-            # Skip LIST nodes - they're virtual containers
+            if node["id"] in list_referenced_by_other:
+                # Promote to SEQUENCE — non-SEQUENCE nodes reference this LIST
+                result.append({
+                    "id": node["id"],
+                    "type": "SEQUENCE",
+                    "config": node.get("config", {}),
+                    "inputs": node.get("inputs", []),
+                })
+            # Otherwise skip (consumed by SEQUENCE expansion or unreferenced)
             continue
 
         if node["type"] == "SEQUENCE":
@@ -546,6 +574,7 @@ def _expand_slice_on(
     sources: Dict[str, str] = None,
     cluster_key: str = None,
     encoding: Dict = None,
+    named_analysis: Dict = None,
 ) -> List[Dict]:
     """
     Expand a SLICE_ON node into primitive SEGMENT + EFFECT + SEQUENCE nodes.
@@ -563,12 +592,18 @@ def _expand_slice_on(
                  :effects (if (odd? i) [invert] [])
                  :acc (inc acc)}))
 
+    When all beats produce composition-mode results (layers + compositor)
+    with the same layer structure, consecutive beats are automatically merged
+    into fewer compositions with time-varying parameter bindings. This can
+    reduce thousands of nodes to a handful.
+
     Args:
         node: The SLICE_ON node to expand
         analysis_data: Analysis results containing times array
         registry: Recipe registry with effect definitions
         sources: Map of source names to node IDs
         cluster_key: Optional cluster key for hashing
+        named_analysis: Mutable dict to inject synthetic analysis tracks into
 
     Returns:
         List of expanded nodes (segments, effects, sequence)
@@ -635,6 +670,12 @@ def _expand_slice_on(
             frame_aligned_starts.append(start_frames * frame_duration)
             frame_aligned_durations.append((end_frames - start_frames) * frame_duration)
 
+        # Phase 1: Evaluate all lambdas upfront
+        videos = config.get("videos", [])
+        all_results = []
+        all_timings = []  # (seg_start, seg_duration) per valid beat
+        original_indices = []  # original beat index for each result
+
         for i, (start, end) in enumerate(slice_times):
             if start >= end:
                 continue
@@ -645,6 +686,10 @@ def _expand_slice_on(
             # Add effect names so they can be referenced as symbols
             for effect_name in registry.get("effects", {}):
                 env[effect_name] = effect_name
+
+            # Make :videos list available to lambda
+            if videos:
+                env["videos"] = videos
 
             env["acc"] = acc
             env["i"] = i
@@ -658,9 +703,7 @@ def _expand_slice_on(
             if not isinstance(result, dict):
                 raise ValueError(f"Reducer must return a dict, got {type(result)}")
 
-            # Extract result
-            source_name = result.get("source")
-            effects = result.get("effects", [])
+            # Extract accumulator
             acc = result.get("acc", acc)
 
             # Segment timing: use frame-aligned values to prevent drift
@@ -679,77 +722,91 @@ def _expand_slice_on(
                 seg_start = frame_aligned_starts[i] if i < len(frame_aligned_starts) else start
                 seg_duration = frame_aligned_durations[i] if i < len(frame_aligned_durations) else (end - start)
 
-            # Resolve source to node ID
-            if isinstance(source_name, Symbol):
-                source_name = source_name.name
-            # source_name could be a name (lookup in sources) or already a node ID
-            # Build set of valid node IDs from sources values
-            valid_node_ids = set(sources.values())
-            if source_name in sources:
-                video_input = sources[source_name]
-            elif source_name in valid_node_ids:
-                # Already a node ID
-                video_input = source_name
-            else:
-                video_input = default_video
+            all_results.append(result)
+            all_timings.append((seg_start, seg_duration))
+            original_indices.append(i)
 
-            # Create SEGMENT node
-            segment_id = f"{base_id}_seg_{i:04d}"
-            segment_node = {
-                "id": segment_id,
-                "type": "SEGMENT",
-                "config": {
-                    "start": seg_start,
-                    "duration": seg_duration,
-                },
-                "inputs": [video_input],
-            }
-            expanded_nodes.append(segment_node)
+        # Phase 2: Merge or expand
+        all_composition = (
+            len(all_results) > 1
+            and all("layers" in r for r in all_results)
+            and named_analysis is not None
+        )
 
-            # Apply effects chain
-            current_input = segment_id
-            for j, effect in enumerate(effects):
-                # Effect can be: string name, Symbol, or dict with params
-                effect_name = None
-                effect_params = {}
+        if all_composition:
+            # All beats are composition mode — try to merge consecutive
+            # beats with the same layer structure
+            _merge_composition_beats(
+                all_results, all_timings, base_id, videos, registry,
+                expanded_nodes, sequence_inputs, named_analysis,
+            )
+        else:
+            # Fallback: expand each beat individually
+            for idx, result in enumerate(all_results):
+                orig_i = original_indices[idx]
+                seg_start, seg_duration = all_timings[idx]
 
-                if isinstance(effect, Symbol):
-                    effect_name = effect.name
-                elif isinstance(effect, str):
-                    effect_name = effect
-                elif isinstance(effect, dict):
-                    # Dict form: {:effect invert :intensity (bind bass)}
-                    effect_name = effect.get("effect")
-                    if isinstance(effect_name, Symbol):
-                        effect_name = effect_name.name
-                    # Copy all params except 'effect'
-                    for k, v in effect.items():
-                        if k != "effect":
-                            effect_params[k] = v
+                if "layers" in result:
+                    # COMPOSITION MODE — multi-source with per-layer effects + compositor
+                    _expand_composition_beat(
+                        result, orig_i, base_id, videos, registry,
+                        seg_start, seg_duration, expanded_nodes, sequence_inputs,
+                    )
+                else:
+                    # SINGLE-SOURCE MODE (existing behavior)
+                    source_name = result.get("source")
+                    effects = result.get("effects", [])
 
-                if not effect_name:
-                    continue
+                    # Resolve source to node ID
+                    if isinstance(source_name, Symbol):
+                        source_name = source_name.name
+                    valid_node_ids = set(sources.values())
+                    if source_name in sources:
+                        video_input = sources[source_name]
+                    elif source_name in valid_node_ids:
+                        video_input = source_name
+                    else:
+                        video_input = default_video
 
-                effect_id = f"{base_id}_fx_{i:04d}_{j}"
-                effect_entry = registry.get("effects", {}).get(effect_name, {})
+                    # Create SEGMENT node
+                    segment_id = f"{base_id}_seg_{orig_i:04d}"
+                    segment_node = {
+                        "id": segment_id,
+                        "type": "SEGMENT",
+                        "config": {
+                            "start": seg_start,
+                            "duration": seg_duration,
+                        },
+                        "inputs": [video_input],
+                    }
+                    expanded_nodes.append(segment_node)
 
-                effect_config = {
-                    "effect": effect_name,
-                    "effect_path": effect_entry.get("path"),
-                }
-                # Add any params (may include Binding objects)
-                effect_config.update(effect_params)
+                    # Apply effects chain
+                    current_input = segment_id
+                    for j, effect in enumerate(effects):
+                        effect_name, effect_params = _parse_effect_spec(effect)
+                        if not effect_name:
+                            continue
 
-                effect_node = {
-                    "id": effect_id,
-                    "type": "EFFECT",
-                    "config": effect_config,
-                    "inputs": [current_input],
-                }
-                expanded_nodes.append(effect_node)
-                current_input = effect_id
+                        effect_id = f"{base_id}_fx_{orig_i:04d}_{j}"
+                        effect_entry = registry.get("effects", {}).get(effect_name, {})
 
-            sequence_inputs.append(current_input)
+                        effect_config = {
+                            "effect": effect_name,
+                            "effect_path": effect_entry.get("path"),
+                        }
+                        effect_config.update(effect_params)
+
+                        effect_node = {
+                            "id": effect_id,
+                            "type": "EFFECT",
+                            "config": effect_config,
+                            "inputs": [current_input],
+                        }
+                        expanded_nodes.append(effect_node)
+                        current_input = effect_id
+
+                    sequence_inputs.append(current_input)
 
     else:
         # Legacy mode - :effect and :pattern
@@ -818,6 +875,369 @@ def _expand_slice_on(
     expanded_nodes.append(list_node)
 
     return expanded_nodes
+
+
+def _parse_effect_spec(effect):
+    """Parse an effect spec into (name, params) from Symbol, string, or dict."""
+    from .parser import Symbol
+
+    effect_name = None
+    effect_params = {}
+
+    if isinstance(effect, Symbol):
+        effect_name = effect.name
+    elif isinstance(effect, str):
+        effect_name = effect
+    elif isinstance(effect, dict):
+        effect_name = effect.get("effect")
+        if isinstance(effect_name, Symbol):
+            effect_name = effect_name.name
+        for k, v in effect.items():
+            if k != "effect":
+                effect_params[k] = v
+
+    return effect_name, effect_params
+
+
+def _expand_composition_beat(result, beat_idx, base_id, videos, registry,
+                              seg_start, seg_duration, expanded_nodes, sequence_inputs):
+    """
+    Expand a composition-mode beat into per-layer SEGMENT + EFFECT nodes
+    and a single composition EFFECT node.
+
+    Args:
+        result: Lambda result dict with 'layers' and optional 'compose'
+        beat_idx: Beat index for ID generation
+        base_id: Base ID prefix
+        videos: List of video node IDs from :videos config
+        registry: Recipe registry with effect definitions
+        seg_start: Segment start time
+        seg_duration: Segment duration
+        expanded_nodes: List to append generated nodes to
+        sequence_inputs: List to append final composition node ID to
+    """
+    layers = result["layers"]
+    compose_spec = result.get("compose", {})
+
+    layer_outputs = []
+    for layer_idx, layer in enumerate(layers):
+        # Resolve video: integer index into videos list, or node ID string
+        video_ref = layer.get("video")
+        if isinstance(video_ref, (int, float)):
+            video_input = videos[int(video_ref)]
+        else:
+            video_input = str(video_ref)
+
+        # SEGMENT for this layer
+        segment_id = f"{base_id}_seg_{beat_idx:04d}_L{layer_idx}"
+        expanded_nodes.append({
+            "id": segment_id,
+            "type": "SEGMENT",
+            "config": {"start": seg_start, "duration": seg_duration},
+            "inputs": [video_input],
+        })
+
+        # Per-layer EFFECT chain
+        current = segment_id
+        for fx_idx, effect in enumerate(layer.get("effects", [])):
+            effect_name, effect_params = _parse_effect_spec(effect)
+            if not effect_name:
+                continue
+            effect_id = f"{base_id}_fx_{beat_idx:04d}_L{layer_idx}_{fx_idx}"
+            effect_entry = registry.get("effects", {}).get(effect_name, {})
+            config = {
+                "effect": effect_name,
+                "effect_path": effect_entry.get("path"),
+            }
+            config.update(effect_params)
+            expanded_nodes.append({
+                "id": effect_id,
+                "type": "EFFECT",
+                "config": config,
+                "inputs": [current],
+            })
+            current = effect_id
+        layer_outputs.append(current)
+
+    # Composition EFFECT node
+    compose_name = compose_spec.get("effect", "blend_multi")
+    compose_id = f"{base_id}_comp_{beat_idx:04d}"
+    compose_entry = registry.get("effects", {}).get(compose_name, {})
+    compose_config = {
+        "effect": compose_name,
+        "effect_path": compose_entry.get("path"),
+        "multi_input": True,
+    }
+    for k, v in compose_spec.items():
+        if k != "effect":
+            compose_config[k] = v
+
+    expanded_nodes.append({
+        "id": compose_id,
+        "type": "EFFECT",
+        "config": compose_config,
+        "inputs": layer_outputs,
+    })
+    sequence_inputs.append(compose_id)
+
+
+def _fingerprint_composition(result):
+    """Create a hashable fingerprint of a composition beat's layer structure.
+
+    Beats with the same fingerprint have the same video refs, effect names,
+    and compositor type — only parameter values differ. Such beats can be
+    merged into a single composition with time-varying bindings.
+    """
+    layers = result.get("layers", [])
+    compose = result.get("compose", {})
+
+    layer_fps = []
+    for layer in layers:
+        video_ref = layer.get("video")
+        effect_names = tuple(
+            _parse_effect_spec(e)[0] for e in layer.get("effects", [])
+        )
+        layer_fps.append((video_ref, effect_names))
+
+    compose_name = compose.get("effect", "blend_multi")
+    # Include static compose params (excluding list-valued params like weights)
+    static_compose = tuple(sorted(
+        (k, v) for k, v in compose.items()
+        if k not in ("effect", "weights") and isinstance(v, (str, int, float, bool))
+    ))
+
+    return (len(layers), tuple(layer_fps), compose_name, static_compose)
+
+
+def _merge_composition_beats(
+    all_results, all_timings, base_id, videos, registry,
+    expanded_nodes, sequence_inputs, named_analysis,
+):
+    """Merge consecutive composition beats with the same layer structure.
+
+    Groups consecutive beats by structural fingerprint. Groups of 2+ beats
+    get merged into a single composition with synthetic analysis tracks for
+    time-varying parameters. Single beats use standard per-beat expansion.
+    """
+    import sys
+
+    # Compute fingerprints
+    fingerprints = [_fingerprint_composition(r) for r in all_results]
+
+    # Group consecutive beats with the same fingerprint
+    groups = []  # list of (start_idx, end_idx_exclusive)
+    group_start = 0
+    for i in range(1, len(fingerprints)):
+        if fingerprints[i] != fingerprints[group_start]:
+            groups.append((group_start, i))
+            group_start = i
+    groups.append((group_start, len(fingerprints)))
+
+    print(f"  Composition merging: {len(all_results)} beats -> {len(groups)} groups", file=sys.stderr)
+
+    for group_idx, (g_start, g_end) in enumerate(groups):
+        group_size = g_end - g_start
+
+        if group_size == 1:
+            # Single beat — use standard expansion
+            result = all_results[g_start]
+            seg_start, seg_duration = all_timings[g_start]
+            _expand_composition_beat(
+                result, g_start, base_id, videos, registry,
+                seg_start, seg_duration, expanded_nodes, sequence_inputs,
+            )
+        else:
+            # Merge group into one composition with time-varying bindings
+            _merge_composition_group(
+                all_results, all_timings,
+                list(range(g_start, g_end)),
+                base_id, group_idx, videos, registry,
+                expanded_nodes, sequence_inputs, named_analysis,
+            )
+
+
+def _merge_composition_group(
+    all_results, all_timings, group_indices,
+    base_id, group_idx, videos, registry,
+    expanded_nodes, sequence_inputs, named_analysis,
+):
+    """Merge a group of same-structure composition beats into one composition.
+
+    Creates:
+    - One SEGMENT per layer (spanning full group duration)
+    - One EFFECT per layer with time-varying params via synthetic analysis tracks
+    - One compositor EFFECT with time-varying weights via synthetic tracks
+    """
+    import sys
+
+    first = all_results[group_indices[0]]
+    layers = first["layers"]
+    compose_spec = first.get("compose", {})
+    num_layers = len(layers)
+
+    # Group timing
+    first_start = all_timings[group_indices[0]][0]
+    last_start, last_dur = all_timings[group_indices[-1]]
+    group_duration = (last_start + last_dur) - first_start
+
+    # Beat start times for synthetic tracks (absolute times)
+    beat_times = [float(all_timings[i][0]) for i in group_indices]
+
+    print(f"    Group {group_idx}: {len(group_indices)} beats, "
+          f"{first_start:.1f}s -> {first_start + group_duration:.1f}s "
+          f"({num_layers} layers)", file=sys.stderr)
+
+    # --- Per-layer segments and effects ---
+    layer_outputs = []
+    for layer_idx in range(num_layers):
+        layer = layers[layer_idx]
+
+        # Resolve video input
+        video_ref = layer.get("video")
+        if isinstance(video_ref, (int, float)):
+            video_input = videos[int(video_ref)]
+        else:
+            video_input = str(video_ref)
+
+        # SEGMENT for this layer (full group duration)
+        segment_id = f"{base_id}_seg_G{group_idx:03d}_L{layer_idx}"
+        expanded_nodes.append({
+            "id": segment_id,
+            "type": "SEGMENT",
+            "config": {"start": first_start, "duration": group_duration},
+            "inputs": [video_input],
+        })
+
+        # Per-layer EFFECT chain
+        current = segment_id
+        effects = layer.get("effects", [])
+        for fx_idx, effect in enumerate(effects):
+            effect_name, first_params = _parse_effect_spec(effect)
+            if not effect_name:
+                continue
+
+            effect_id = f"{base_id}_fx_G{group_idx:03d}_L{layer_idx}_{fx_idx}"
+            effect_entry = registry.get("effects", {}).get(effect_name, {})
+            fx_config = {
+                "effect": effect_name,
+                "effect_path": effect_entry.get("path"),
+            }
+
+            # For each param, check if it varies across beats
+            for param_name, first_val in first_params.items():
+                values = []
+                for bi in group_indices:
+                    beat_layer = all_results[bi]["layers"][layer_idx]
+                    beat_effects = beat_layer.get("effects", [])
+                    if fx_idx < len(beat_effects):
+                        _, beat_params = _parse_effect_spec(beat_effects[fx_idx])
+                        values.append(float(beat_params.get(param_name, first_val)))
+                    else:
+                        values.append(float(first_val))
+
+                # Check if all values are identical
+                if all(v == values[0] for v in values):
+                    fx_config[param_name] = values[0]
+                else:
+                    # Create synthetic analysis track
+                    # Prefix with 'syn_' to ensure valid S-expression symbol
+                    # (base_id may start with digits, which the parser splits)
+                    track_name = f"syn_{base_id}_L{layer_idx}_fx{fx_idx}_{param_name}"
+                    named_analysis[track_name] = {
+                        "times": beat_times,
+                        "values": values,
+                    }
+                    fx_config[param_name] = {
+                        "_binding": True,
+                        "source": track_name,
+                        "feature": "values",
+                        "range": [0.0, 1.0],  # pass-through
+                    }
+
+            expanded_nodes.append({
+                "id": effect_id,
+                "type": "EFFECT",
+                "config": fx_config,
+                "inputs": [current],
+            })
+            current = effect_id
+
+        layer_outputs.append(current)
+
+    # --- Compositor ---
+    compose_name = compose_spec.get("effect", "blend_multi")
+    compose_id = f"{base_id}_comp_G{group_idx:03d}"
+    compose_entry = registry.get("effects", {}).get(compose_name, {})
+    compose_config = {
+        "effect": compose_name,
+        "effect_path": compose_entry.get("path"),
+        "multi_input": True,
+    }
+
+    for k, v in compose_spec.items():
+        if k == "effect":
+            continue
+
+        if isinstance(v, list):
+            # List param (e.g., weights) — check each element
+            merged_list = []
+            for elem_idx in range(len(v)):
+                elem_values = []
+                for bi in group_indices:
+                    beat_compose = all_results[bi].get("compose", {})
+                    beat_v = beat_compose.get(k, v)
+                    if isinstance(beat_v, list) and elem_idx < len(beat_v):
+                        elem_values.append(float(beat_v[elem_idx]))
+                    else:
+                        elem_values.append(float(v[elem_idx]))
+
+                if all(ev == elem_values[0] for ev in elem_values):
+                    merged_list.append(elem_values[0])
+                else:
+                    track_name = f"syn_{base_id}_comp_{k}_{elem_idx}"
+                    named_analysis[track_name] = {
+                        "times": beat_times,
+                        "values": elem_values,
+                    }
+                    merged_list.append({
+                        "_binding": True,
+                        "source": track_name,
+                        "feature": "values",
+                        "range": [0.0, 1.0],
+                    })
+            compose_config[k] = merged_list
+        elif isinstance(v, (int, float)):
+            # Scalar param — check if it varies
+            values = []
+            for bi in group_indices:
+                beat_compose = all_results[bi].get("compose", {})
+                values.append(float(beat_compose.get(k, v)))
+
+            if all(val == values[0] for val in values):
+                compose_config[k] = values[0]
+            else:
+                track_name = f"syn_{base_id}_comp_{k}"
+                named_analysis[track_name] = {
+                    "times": beat_times,
+                    "values": values,
+                }
+                compose_config[k] = {
+                    "_binding": True,
+                    "source": track_name,
+                    "feature": "values",
+                    "range": [0.0, 1.0],
+                }
+        else:
+            # String or other — keep as-is
+            compose_config[k] = v
+
+    expanded_nodes.append({
+        "id": compose_id,
+        "type": "EFFECT",
+        "config": compose_config,
+        "inputs": layer_outputs,
+    })
+    sequence_inputs.append(compose_id)
 
 
 def _parse_construct_params(params_list: list) -> tuple:
@@ -1241,13 +1661,21 @@ def _expand_nodes(
             if inputs and inputs[0] in outputs:
                 input_path = outputs[inputs[0]]
                 if isinstance(input_path, Path):
-                    # Pre-execute segment to get output path
-                    # This is needed if ANALYZE depends on this segment
-                    import sys
-                    print(f"  Pre-executing segment: {node_id[:16]}...", file=sys.stderr)
-                    output_path = _pre_execute_segment(node, input_path, work_dir)
-                    outputs[node_id] = output_path
-                    pre_executed.add(node_id)
+                    # Skip pre-execution if config contains unresolved bindings
+                    seg_config = node.get("config", {})
+                    has_binding = any(
+                        isinstance(v, Binding) or (isinstance(v, dict) and v.get("_binding"))
+                        for v in [seg_config.get("start"), seg_config.get("duration"), seg_config.get("end")]
+                        if v is not None
+                    )
+                    if not has_binding:
+                        # Pre-execute segment to get output path
+                        # This is needed if ANALYZE depends on this segment
+                        import sys
+                        print(f"  Pre-executing segment: {node_id[:16]}...", file=sys.stderr)
+                        output_path = _pre_execute_segment(node, input_path, work_dir)
+                        outputs[node_id] = output_path
+                        pre_executed.add(node_id)
             expanded.append(node)
             expanded_ids.add(node_id)
 
@@ -1318,7 +1746,7 @@ def _expand_nodes(
             if has_lambda:
                 if len(inputs) < 1:
                     raise ValueError(f"SLICE_ON {node_id} requires analysis input")
-                analysis_id = inputs[-1]  # Last input is analysis
+                analysis_id = inputs[0]  # First input is analysis
             else:
                 if len(inputs) < 2:
                     raise ValueError(f"SLICE_ON {node_id} requires video and analysis inputs")
@@ -1337,7 +1765,7 @@ def _expand_nodes(
                     sources[n["name"]] = n["id"]
 
             analysis_data = analysis_results[analysis_id]
-            slice_nodes = _expand_slice_on(node, analysis_data, registry, sources, cluster_key, encoding)
+            slice_nodes = _expand_slice_on(node, analysis_data, registry, sources, cluster_key, encoding, named_analysis)
 
             for sn in slice_nodes:
                 if sn["id"] not in expanded_ids:
@@ -1412,8 +1840,16 @@ def create_plan(
     """
     inputs = inputs or {}
 
-    # Compute recipe hash
-    recipe_hash = _stable_hash(recipe.to_dict(), cluster_key)
+    # Compute source hash as CID (SHA256 of raw bytes) - this IS the content address
+    source_hash = hashlib.sha256(recipe.source_text.encode('utf-8')).hexdigest() if recipe.source_text else ""
+
+    # Compute params hash (use JSON + SHA256 for consistency with cache.py)
+    if recipe.resolved_params:
+        import json
+        params_str = json.dumps(recipe.resolved_params, sort_keys=True, default=str)
+        params_hash = hashlib.sha256(params_str.encode()).hexdigest()
+    else:
+        params_hash = ""
 
     # Check if recipe has expandable nodes (SLICE_ON, etc.)
     has_expandable = any(n["type"] in EXPANDABLE_TYPES for n in recipe.nodes)
@@ -1472,7 +1908,6 @@ def create_plan(
     stage_plans = []
     stage_order = []
     stage_levels = {}
-    stage_cache_ids = {}
 
     if recipe.stages:
         # Build mapping from node_id to stage
@@ -1484,23 +1919,10 @@ def create_plan(
         # Compute stage levels (for parallel execution)
         stage_levels = _compute_stage_levels(recipe.stages)
 
-        # Compute stage cache IDs
-        # Stage cache ID = hash of: stage_name + required stage cache_ids + node content
-        stage_cache_ids = {}
-        for stage_name in recipe.stage_order:
-            stage = next(s for s in recipe.stages if s.name == stage_name)
-            stage_cache_ids[stage_name] = _compute_stage_cache_id(
-                stage,
-                stage_cache_ids,
-                cache_ids,
-                cluster_key,
-            )
-
         # Tag each step with stage info
         for step in steps:
             if step.step_id in node_to_stage:
                 step.stage = node_to_stage[step.step_id]
-                step.stage_cache_id = stage_cache_ids.get(step.stage)
 
         # Build stage plans
         for stage_name in recipe.stage_order:
@@ -1515,7 +1937,6 @@ def create_plan(
 
             stage_plans.append(StagePlan(
                 stage_name=stage_name,
-                cache_id=stage_cache_ids[stage_name],
                 steps=stage_steps,
                 requires=stage.requires,
                 output_bindings=output_cache_ids,
@@ -1524,20 +1945,19 @@ def create_plan(
 
         stage_order = recipe.stage_order
 
-    # Compute plan ID
+    # Compute plan ID from source CID + steps
     plan_content = {
-        "recipe_hash": recipe_hash,
+        "source_cid": source_hash,
         "steps": [{"id": s.step_id, "cache_id": s.cache_id} for s in steps],
         "inputs": inputs,
     }
-    if stage_cache_ids:
-        plan_content["stage_cache_ids"] = stage_cache_ids
     plan_id = _stable_hash(plan_content, cluster_key)
 
     return ExecutionPlanSexp(
         plan_id=plan_id,
-        recipe_id=recipe.name,
-        recipe_hash=recipe_hash,
+        source_hash=source_hash,
+        params=recipe.resolved_params,
+        params_hash=params_hash,
         steps=steps,
         output_step_id=recipe.output_node_id,
         inputs=inputs,
@@ -1545,7 +1965,6 @@ def create_plan(
         stage_plans=stage_plans,
         stage_order=stage_order,
         stage_levels=stage_levels,
-        stage_cache_ids=stage_cache_ids,
         effects_registry=recipe.registry.get("effects", {}),
         minimal_primitives=recipe.minimal_primitives,
     )
@@ -1589,14 +2008,19 @@ def _create_step(
     # Resolve registry references
     resolved_config = _resolve_config(config, registry, inputs)
 
-    # Get input cache IDs
+    # Get input cache IDs (direct graph inputs)
     input_cache_ids = [cache_ids[inp] for inp in node_inputs if inp in cache_ids]
 
-    # Compute cache ID
+    # Also include analysis_refs as dependencies (for binding resolution)
+    # These are implicit inputs that affect the computation result
+    analysis_refs = resolved_config.get("analysis_refs", [])
+    analysis_cache_ids = [cache_ids[ref] for ref in analysis_refs if ref in cache_ids]
+
+    # Compute cache ID including both inputs and analysis dependencies
     cache_content = {
         "node_type": node_type,
         "config": resolved_config,
-        "inputs": sorted(input_cache_ids),
+        "inputs": sorted(input_cache_ids + analysis_cache_ids),
     }
     cache_id = _stable_hash(cache_content, cluster_key)
 
@@ -1667,7 +2091,10 @@ def _resolve_config(
 
 
 def _compute_levels(steps: List[PlanStep], nodes_by_id: Dict) -> None:
-    """Compute dependency levels for steps."""
+    """Compute dependency levels for steps.
+
+    Considers both inputs (data dependencies) and analysis_refs (binding dependencies).
+    """
     levels = {}
 
     def compute_level(step_id: str) -> int:
@@ -1675,12 +2102,24 @@ def _compute_levels(steps: List[PlanStep], nodes_by_id: Dict) -> None:
             return levels[step_id]
 
         node = nodes_by_id.get(step_id)
-        if not node or not node.get("inputs"):
+        if not node:
             levels[step_id] = 0
             return 0
 
-        max_input = max(compute_level(inp) for inp in node["inputs"])
-        levels[step_id] = max_input + 1
+        # Collect all dependencies: inputs + analysis_refs
+        deps = list(node.get("inputs", []))
+
+        # Add analysis_refs as dependencies (for bindings to analysis data)
+        config = node.get("config", {})
+        analysis_refs = config.get("analysis_refs", [])
+        deps.extend(analysis_refs)
+
+        if not deps:
+            levels[step_id] = 0
+            return 0
+
+        max_dep = max(compute_level(dep) for dep in deps)
+        levels[step_id] = max_dep + 1
         return levels[step_id]
 
     for step in steps:
@@ -1715,31 +2154,6 @@ def _compute_stage_levels(stages: List) -> Dict[str, int]:
         compute_level(stage.name)
 
     return levels
-
-
-def _compute_stage_cache_id(
-    stage,
-    stage_cache_ids: Dict[str, str],
-    node_cache_ids: Dict[str, str],
-    cluster_key: str = None,
-) -> str:
-    """
-    Compute cache ID for a stage.
-
-    Stage cache ID = SHA3-256 of:
-    - stage name
-    - required stage cache IDs
-    - node cache IDs in the stage
-    """
-    cache_content = {
-        "stage": stage.name,
-        "requires": {req: stage_cache_ids.get(req, "") for req in stage.requires},
-        "nodes": sorted([
-            node_cache_ids.get(node_id, node_id)
-            for node_id in stage.node_ids
-        ]),
-    }
-    return _stable_hash(cache_content, cluster_key)
 
 
 def step_to_task_sexp(step: PlanStep) -> List:
