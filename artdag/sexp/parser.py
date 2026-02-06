@@ -96,7 +96,7 @@ class Tokenizer:
     STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
     NUMBER = re.compile(r'-?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?')
     KEYWORD = re.compile(r':[a-zA-Z_][a-zA-Z0-9_-]*')
-    SYMBOL = re.compile(r'[a-zA-Z_*+\-><=/!?][a-zA-Z0-9_*+\-><=/!?.]*')
+    SYMBOL = re.compile(r'[a-zA-Z_*+\-><=/!?][a-zA-Z0-9_*+\-><=/!?.:]*')
 
     def __init__(self, text: str):
         self.text = text

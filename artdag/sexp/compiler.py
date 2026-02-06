@@ -15,6 +15,32 @@ import hashlib
 import json
 
 from .parser import Symbol, Keyword, Lambda, parse, serialize
+from pathlib import Path
+
+
+def compute_content_cid(content: str) -> str:
+    """Compute content-addressed ID (SHA256 hash) for content.
+
+    This is used for effects, recipes, and other text content that
+    will be stored in the cache. The cid can be used to fetch the
+    content from cache or IPFS.
+    """
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def compute_file_cid(file_path: Path) -> str:
+    """Compute content-addressed ID for a file.
+
+    Args:
+        file_path: Path to the file
+
+    Returns:
+        SHA3-256 hash of file contents
+    """
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    content = file_path.read_text()
+    return compute_content_cid(content)
 
 
 def _serialize_for_hash(obj) -> str:
@@ -91,6 +117,8 @@ class CompiledRecipe:
     stages: List[CompiledStage] = field(default_factory=list)  # Compiled stages
     stage_order: List[str] = field(default_factory=list)  # Topologically sorted stage names
     minimal_primitives: bool = False  # If True, only core primitives available
+    source_text: str = ""  # Original source text for stable hashing
+    resolved_params: Dict[str, Any] = field(default_factory=dict)  # Resolved parameter values
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary format (compatible with YAML structure)."""
@@ -112,9 +140,13 @@ class CompiledRecipe:
 @dataclass
 class CompilerContext:
     """Compilation context tracking bindings and nodes."""
-    registry: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {"assets": {}, "effects": {}, "analyzers": {}, "constructs": {}})
+    registry: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {"assets": {}, "effects": {}, "analyzers": {}, "constructs": {}, "templates": {}, "includes": {}})
+    template_call_count: int = 0
     bindings: Dict[str, str] = field(default_factory=dict)  # name -> node_id
     nodes: Dict[str, Dict[str, Any]] = field(default_factory=dict)  # node_id -> node
+
+    # Recipe directory for resolving relative paths
+    recipe_dir: Optional[Path] = None
 
     # Stage tracking
     current_stage: Optional[str] = None  # Name of stage currently being compiled
@@ -317,7 +349,11 @@ def _parse_params(value: Any) -> List[ParamDef]:
                     else:
                         param_type = str(kw_value)
                 elif item.name == "default":
-                    default = kw_value
+                    # Convert nil symbol to Python None
+                    if isinstance(kw_value, Symbol) and kw_value.name == "nil":
+                        default = None
+                    else:
+                        default = kw_value
                 elif item.name == "desc" or item.name == "description":
                     desc = str(kw_value)
                 elif item.name == "range":
@@ -364,7 +400,7 @@ def _parse_params(value: Any) -> List[ParamDef]:
     return params
 
 
-def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> CompiledRecipe:
+def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None, recipe_dir: Path = None, source_text: str = "") -> CompiledRecipe:
     """
     Compile an S-expression recipe into internal format.
 
@@ -372,6 +408,8 @@ def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> Compil
         sexp: Parsed S-expression (list starting with 'recipe' symbol)
         initial_bindings: Optional dict of name -> value bindings to inject before compilation.
                          These can be referenced as variables in the recipe.
+        recipe_dir: Directory containing the recipe file, for resolving relative paths.
+        source_text: Original source text for stable hashing.
 
     Returns:
         CompiledRecipe with nodes and registry
@@ -395,7 +433,7 @@ def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> Compil
     name = sexp[1]
 
     # Parse keyword arguments and body
-    ctx = CompilerContext()
+    ctx = CompilerContext(recipe_dir=recipe_dir)
 
     version = "1.0"
     description = ""
@@ -497,6 +535,8 @@ def compile_recipe(sexp: Any, initial_bindings: Dict[str, Any] = None) -> Compil
         stages=stages,
         stage_order=stage_order,
         minimal_primitives=minimal_primitives,
+        source_text=source_text,
+        resolved_params=initial_bindings or {},
     )
 
 
@@ -536,6 +576,10 @@ def _compile_expr(expr: Any, ctx: CompilerContext) -> Optional[str]:
     if name == "construct":
         return _compile_construct_decl(expr, ctx)
 
+    # Template definition
+    if name == "deftemplate":
+        return _compile_deftemplate(expr, ctx)
+
     # Include - load and evaluate external sexp file
     if name == "include":
         return _compile_include(expr, ctx)
@@ -569,6 +613,14 @@ def _compile_expr(expr: Any, ctx: CompilerContext) -> Optional[str]:
         return _compile_mux(expr, ctx)
     if name == "analyze":
         return _compile_analyze(expr, ctx)
+    if name == "scan":
+        return _compile_scan(expr, ctx)
+    if name == "blend-multi":
+        return _compile_blend_multi(expr, ctx)
+    if name == "make-rng":
+        return _compile_make_rng(expr, ctx)
+    if name == "next-seed":
+        return _compile_next_seed(expr, ctx)
 
     # Check if it's a registered construct call BEFORE built-in slice-on
     # This allows user-defined constructs to override built-ins
@@ -604,6 +656,10 @@ def _compile_expr(expr: Any, ctx: CompilerContext) -> Optional[str]:
             return result
         except Exception as e:
             raise CompileError(f"Error evaluating {name}: {e}")
+
+    # Template invocation
+    if name in ctx.registry.get("templates", {}):
+        return _compile_template_call(expr, ctx)
 
     raise CompileError(f"Unknown expression type: {name}")
 
@@ -655,6 +711,38 @@ def _compile_asset(expr: List, ctx: CompilerContext) -> None:
     return None
 
 
+def _resolve_effect_path(path: str, ctx: CompilerContext) -> Optional[Path]:
+    """Resolve an effect path relative to recipe directory.
+
+    Args:
+        path: Relative or absolute path to effect file
+        ctx: Compiler context with recipe_dir
+
+    Returns:
+        Resolved absolute Path, or None if not found
+    """
+    effect_path = Path(path)
+
+    # Already absolute
+    if effect_path.is_absolute() and effect_path.exists():
+        return effect_path
+
+    # Try relative to recipe directory
+    if ctx.recipe_dir:
+        recipe_relative = ctx.recipe_dir / path
+        if recipe_relative.exists():
+            return recipe_relative.resolve()
+
+    # Try relative to cwd
+    import os
+    cwd = Path(os.getcwd())
+    cwd_relative = cwd / path
+    if cwd_relative.exists():
+        return cwd_relative.resolve()
+
+    return None
+
+
 def _compile_effect_decl(expr: List, ctx: CompilerContext) -> Optional[str]:
     """
     Compile effect - either declaration or node.
@@ -682,9 +770,18 @@ def _compile_effect_decl(expr: List, ctx: CompilerContext) -> Optional[str]:
         if isinstance(temporal, Symbol):
             temporal = temporal.name.lower() == "true"
 
+        effect_path = kwargs.get("path")
+
+        # Compute cid from file content if path provided and no cid
+        if effect_path and not effect_cid:
+            resolved_path = _resolve_effect_path(effect_path, ctx)
+            if resolved_path and resolved_path.exists():
+                effect_cid = compute_file_cid(resolved_path)
+                effect_path = str(resolved_path)  # Store absolute path
+
         ctx.registry["effects"][name] = {
             "cid": effect_cid,
-            "path": kwargs.get("path"),  # Local path for development
+            "path": effect_path,
             "url": kwargs.get("url"),
             "temporal": temporal,
         }
@@ -854,6 +951,7 @@ def _compile_include(expr: List, ctx: CompilerContext) -> None:
         - (analyzer name :path "...") declarations
         - (effect name :path "...") declarations
         - (construct name :path "...") declarations
+        - (deftemplate name (params...) body...) template definitions
         - (def name value) bindings
 
     For web-based systems:
@@ -916,6 +1014,10 @@ def _compile_include(expr: List, ctx: CompilerContext) -> None:
 
         content = include_path.read_text()
 
+        # Track included file by CID for upload/caching
+        include_cid = compute_content_cid(content)
+        ctx.registry["includes"][str(include_path.resolve())] = include_cid
+
     if content is None:
         raise CompileError(f"Could not load include: path={path}, cid={cid}")
 
@@ -953,6 +1055,10 @@ def _compile_include(expr: List, ctx: CompilerContext) -> None:
             elif form == "construct":
                 # (construct name :path "..." [:cid "..."])
                 _compile_construct_decl(sexp, ctx)
+
+            elif form == "deftemplate":
+                # (deftemplate name (params...) body...)
+                _compile_deftemplate(sexp, ctx)
 
             else:
                 # Try to evaluate as expression
@@ -1063,6 +1169,15 @@ def _compile_def(expr: List, ctx: CompilerContext) -> None:
         return None
 
     node_id = _compile_expr(body, ctx)
+
+    # Multi-scan dict emit: expand field bindings
+    if isinstance(node_id, dict) and node_id.get("_multi_scan"):
+        for field_name, field_node_id in node_id["fields"].items():
+            binding_name = f"{name.name}-{field_name}"
+            ctx.bindings[binding_name] = field_node_id
+            if field_node_id in ctx.nodes:
+                ctx.nodes[field_node_id]["name"] = binding_name
+        return None
 
     # If result is a simple value (from evaluated pure function), store it directly
     # This includes lists, tuples, dicts from pure functions like `list`
@@ -1435,19 +1550,39 @@ def _compile_effect_node(expr: List, ctx: CompilerContext) -> str:
 
     config = {"effect": effect_name}
 
-    # Look up effect_path from registry if available
+    # Look up effect info from registry
     effects_registry = ctx.registry.get("effects", {})
     if effect_name in effects_registry:
         effect_info = effects_registry[effect_name]
-        if isinstance(effect_info, dict) and "path" in effect_info:
-            config["effect_path"] = effect_info["path"]
+        if isinstance(effect_info, dict):
+            if "path" in effect_info:
+                config["effect_path"] = effect_info["path"]
+            if "cid" in effect_info and effect_info["cid"]:
+                config["effect_cid"] = effect_info["cid"]
         elif isinstance(effect_info, str):
             config["effect_path"] = effect_info
 
+    # Include full effects_registry with cids for workers to fetch dependencies
+    # Only include effects that have cids (content-addressed)
+    effects_with_cids = {}
+    for name, info in effects_registry.items():
+        if isinstance(info, dict) and info.get("cid"):
+            effects_with_cids[name] = info["cid"]
+    if effects_with_cids:
+        config["effects_registry"] = effects_with_cids
+
     # Process parameter values, looking for bind expressions
+    # Also track analysis references for workers
+    analysis_refs = set()
     for k, v in kwargs.items():
         if k not in ("hash", "url"):
-            config[k] = _process_value(v, ctx)
+            processed = _process_value(v, ctx)
+            config[k] = processed
+            # Extract analysis references from bind expressions
+            _extract_analysis_refs(processed, analysis_refs)
+
+    if analysis_refs:
+        config["analysis_refs"] = list(analysis_refs)
 
     # Collect inputs - first from threading (prev_id), then from additional args
     inputs = []
@@ -1468,18 +1603,53 @@ def _compile_effect_node(expr: List, ctx: CompilerContext) -> str:
     return ctx.add_node("EFFECT", config, inputs)
 
 
+def _extract_analysis_refs(value: Any, refs: set) -> None:
+    """Extract analysis node references from a processed value.
+
+    Bind expressions contain references to analysis nodes. This function
+    extracts those references so workers know which analysis data they need.
+    """
+    if isinstance(value, dict):
+        # Check if this is a bind expression (has _binding flag or source/ref key)
+        if value.get("_binding") or "bind" in value or "ref" in value or "source" in value:
+            ref = value.get("source") or value.get("ref") or value.get("bind")
+            if ref:
+                refs.add(ref)
+        # Recursively check nested dicts
+        for v in value.values():
+            _extract_analysis_refs(v, refs)
+    elif isinstance(value, list):
+        for item in value:
+            _extract_analysis_refs(item, refs)
+
+
 def _compile_segment(expr: List, ctx: CompilerContext) -> str:
     """Compile (segment :start 0.0 :end 2.0 [input])."""
     args, kwargs = _parse_kwargs(expr, 1)
     args, kwargs, prev_id = _extract_prev_id(args, kwargs)
 
     config = {}
+    analysis_refs = set()
+
     if "start" in kwargs:
-        config["start"] = float(kwargs["start"])
+        val = _process_value(kwargs["start"], ctx)
+        # Binding dicts are preserved for runtime resolution, None values are skipped
+        if val is not None:
+            config["start"] = val if isinstance(val, dict) and val.get("_binding") else float(val)
+            _extract_analysis_refs(config.get("start"), analysis_refs)
     if "end" in kwargs:
-        config["end"] = float(kwargs["end"])
+        val = _process_value(kwargs["end"], ctx)
+        if val is not None:
+            config["end"] = val if isinstance(val, dict) and val.get("_binding") else float(val)
+            _extract_analysis_refs(config.get("end"), analysis_refs)
     if "duration" in kwargs:
-        config["duration"] = float(kwargs["duration"])
+        val = _process_value(kwargs["duration"], ctx)
+        if val is not None:
+            config["duration"] = val if isinstance(val, dict) and val.get("_binding") else float(val)
+            _extract_analysis_refs(config.get("duration"), analysis_refs)
+
+    if analysis_refs:
+        config["analysis_refs"] = list(analysis_refs)
 
     inputs = []
     if prev_id:
@@ -1666,6 +1836,20 @@ def _compile_slice_on(expr: List, ctx: CompilerContext) -> str:
         "bindings": dict(ctx.bindings),
     }
 
+    # Optional :videos list for multi-source composition mode
+    videos_list = kwargs.get("videos")
+    if videos_list is not None:
+        if not isinstance(videos_list, list):
+            raise CompileError(":videos must be a list")
+        resolved_videos = []
+        for v in videos_list:
+            resolved_videos.append(_resolve_input(v, ctx, None))
+        config["videos"] = resolved_videos
+        # Add to inputs so planner knows about dependencies
+        for vid in resolved_videos:
+            if vid not in inputs:
+                inputs.append(vid)
+
     return ctx.add_node("SLICE_ON", config, inputs)
 
 
@@ -1812,29 +1996,458 @@ def _compile_bind(expr: List, ctx: CompilerContext) -> Dict[str, Any]:
 
 def _process_value(value: Any, ctx: CompilerContext) -> Any:
     """
-    Process a value, resolving nested expressions like bind.
+    Process a value, resolving nested expressions like bind and math.
 
-    Returns the processed value (could be a binding dict, node ref, or literal).
+    Returns the processed value (could be a binding dict, expression dict, node ref, or literal).
+
+    Supported expressions:
+        (bind source feature :range [lo hi])  - bind to analysis data
+        (+ a b), (- a b), (* a b), (/ a b), (mod a b)  - math operations
+        time  - current frame time in seconds
+        frame - current frame number
     """
+    # Math operators that create runtime expressions
+    MATH_OPS = {'+', '-', '*', '/', 'mod', 'min', 'max', 'abs', 'sin', 'cos',
+                'if', '<', '>', '<=', '>=', '=',
+                'rand', 'rand-int', 'rand-range',
+                'floor', 'ceil', 'nth'}
+
     if isinstance(value, Symbol):
+        # Special runtime symbols
+        if value.name == "time":
+            return {"_expr": True, "op": "time"}
+        if value.name == "frame":
+            return {"_expr": True, "op": "frame"}
         # Resolve symbol from bindings
         if value.name in ctx.bindings:
             return ctx.bindings[value.name]
         # Return as-is if not found (could be an effect reference, etc.)
         return value
+
     if isinstance(value, list) and len(value) > 0:
         head = value[0]
-        if isinstance(head, Symbol) and head.name == "bind":
+        head_name = head.name if isinstance(head, Symbol) else None
+
+        if head_name == "bind":
             return _compile_bind(value, ctx)
+
         # Handle lambda expressions - parse but don't compile
-        if isinstance(head, Symbol) and head.name in ("lambda", "fn"):
+        if head_name in ("lambda", "fn"):
             return _parse_lambda(value)
+
+        # Handle dict expressions - keyword-value pairs for runtime dict construction
+        if head_name == "dict":
+            keys = []
+            vals = []
+            i = 1
+            while i < len(value):
+                if isinstance(value[i], Keyword):
+                    keys.append(value[i].name)
+                    if i + 1 < len(value):
+                        vals.append(_process_value(value[i + 1], ctx))
+                    i += 2
+                else:
+                    i += 1
+            return {"_expr": True, "op": "dict", "keys": keys, "args": vals}
+
+        # Handle math expressions - preserve for runtime evaluation
+        if head_name in MATH_OPS:
+            processed_args = [_process_value(arg, ctx) for arg in value[1:]]
+            return {"_expr": True, "op": head_name, "args": processed_args}
+
         # Could be other nested expressions
         return _compile_expr(value, ctx)
+
     return value
 
 
-def compile_string(text: str, initial_bindings: Dict[str, Any] = None) -> CompiledRecipe:
+def _compile_scan_expr(value: Any, ctx: CompilerContext) -> Any:
+    """
+    Compile an expression for use in scan step/emit.
+
+    Like _process_value but treats unbound symbols as runtime variable
+    references (for acc, dict fields like rem/hue, etc.).
+    """
+    SCAN_OPS = {
+        '+', '-', '*', '/', 'mod', 'min', 'max', 'abs', 'sin', 'cos',
+        'if', '<', '>', '<=', '>=', '=',
+        'rand', 'rand-int', 'rand-range',
+        'floor', 'ceil', 'nth',
+    }
+
+    if isinstance(value, (int, float)):
+        return value
+
+    if isinstance(value, Keyword):
+        return value.name
+
+    if isinstance(value, Symbol):
+        # Known runtime symbols
+        if value.name in ("time", "frame"):
+            return {"_expr": True, "op": value.name}
+        # Check bindings for compile-time constants (e.g., recipe params)
+        if value.name in ctx.bindings:
+            bound = ctx.bindings[value.name]
+            if isinstance(bound, (int, float, str, bool)):
+                return bound
+        # Runtime variable reference (acc, rem, hue, etc.)
+        return {"_expr": True, "op": "var", "name": value.name}
+
+    if isinstance(value, list) and len(value) > 0:
+        head = value[0]
+        head_name = head.name if isinstance(head, Symbol) else None
+
+        if head_name == "dict":
+            # (dict :key1 val1 :key2 val2)
+            keys = []
+            args = []
+            i = 1
+            while i < len(value):
+                if isinstance(value[i], Keyword):
+                    keys.append(value[i].name)
+                    if i + 1 < len(value):
+                        args.append(_compile_scan_expr(value[i + 1], ctx))
+                    i += 2
+                else:
+                    i += 1
+            return {"_expr": True, "op": "dict", "keys": keys, "args": args}
+
+        if head_name in SCAN_OPS:
+            processed_args = [_compile_scan_expr(arg, ctx) for arg in value[1:]]
+            return {"_expr": True, "op": head_name, "args": processed_args}
+
+        # Fall through to _process_value for bind expressions, etc.
+        return _process_value(value, ctx)
+
+    return value
+
+
+def _eval_const_expr(value, ctx: 'CompilerContext'):
+    """Evaluate a compile-time constant expression.
+
+    Supports literals, symbol lookups in ctx.bindings, and basic arithmetic.
+    Used for values like scan :seed that must resolve to a number at compile time.
+    """
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, Symbol):
+        if value.name in ctx.bindings:
+            bound = ctx.bindings[value.name]
+            if isinstance(bound, (int, float)):
+                return bound
+        raise CompileError(f"Cannot resolve symbol '{value.name}' to a constant")
+    if isinstance(value, list) and len(value) >= 1:
+        head = value[0]
+        if isinstance(head, Symbol):
+            name = head.name
+            if name == 'next-seed' and len(value) == 2:
+                rng_val = _resolve_rng_value(value[1], ctx)
+                return _derive_seed(rng_val)
+            args = [_eval_const_expr(a, ctx) for a in value[1:]]
+            if name == '+' and len(args) >= 2:
+                return args[0] + args[1]
+            if name == '-' and len(args) >= 2:
+                return args[0] - args[1]
+            if name == '*' and len(args) >= 2:
+                return args[0] * args[1]
+            if name == '/' and len(args) >= 2:
+                return args[0] / args[1] if args[1] != 0 else 0
+            if name == 'mod' and len(args) >= 2:
+                return args[0] % args[1] if args[1] != 0 else 0
+            raise CompileError(f"Unsupported constant expression operator: {name}")
+    raise CompileError(f"Cannot evaluate as constant: {value}")
+
+
+def _derive_seed(rng_val: dict) -> int:
+    """Derive next unique seed from RNG value, incrementing counter."""
+    master = rng_val["master_seed"]
+    counter = rng_val["_counter"]
+    digest = hashlib.sha256(f"{master}:{counter[0]}".encode()).hexdigest()[:8]
+    seed = int(digest, 16)
+    counter[0] += 1
+    return seed
+
+
+def _resolve_rng_value(ref, ctx) -> dict:
+    """Resolve a reference to an RNG value dict."""
+    if isinstance(ref, dict) and ref.get("_rng"):
+        return ref
+    if isinstance(ref, Symbol):
+        if ref.name in ctx.bindings:
+            val = ctx.bindings[ref.name]
+            if isinstance(val, dict) and val.get("_rng"):
+                return val
+        raise CompileError(f"Symbol '{ref.name}' is not an RNG value")
+    raise CompileError(f"Expected RNG value, got {type(ref).__name__}")
+
+
+def _compile_make_rng(expr, ctx):
+    """(make-rng SEED) -> compile-time RNG value dict."""
+    if len(expr) != 2:
+        raise CompileError("make-rng requires exactly 1 argument: seed")
+    seed_val = _eval_const_expr(expr[1], ctx)
+    return {"_rng": True, "master_seed": int(seed_val), "_counter": [0]}
+
+
+def _compile_next_seed(expr, ctx):
+    """(next-seed RNG) -> integer seed drawn from RNG."""
+    if len(expr) != 2:
+        raise CompileError("next-seed requires exactly 1 argument: rng")
+    rng_val = _resolve_rng_value(expr[1], ctx)
+    return _derive_seed(rng_val)
+
+
+def _compile_scan(expr: List, ctx: CompilerContext) -> str:
+    """
+    Compile (scan source :seed N :init EXPR :step EXPR :emit EXPR).
+
+    Creates a SCAN node that produces a time-series by iterating over
+    source analysis events with a step function and emit expression.
+
+    The accumulator can be a number or a dict. Dict field names become
+    accessible as variables in step/emit expressions.
+
+    The :seed parameter supports compile-time constant expressions,
+    e.g. (+ seed 100) where seed is a template parameter.
+
+    Examples:
+        ;; Simple counter accumulator
+        (scan beat-data :seed 42 :init 0
+          :step (if (> acc 0) (- acc 1) (if (< (rand) 0.1) (rand-int 1 5) 0))
+          :emit (if (> acc 0) 1 0))
+
+        ;; Dict accumulator with named fields
+        (scan beat-data :seed 101 :init (dict :rem 0 :hue 0)
+          :step (if (> rem 0)
+                    (dict :rem (- rem 1) :hue hue)
+                    (if (< (rand) 0.1)
+                        (dict :rem (rand-int 1 5) :hue (rand-range 30 330))
+                        (dict :rem 0 :hue 0)))
+          :emit (if (> rem 0) hue 0))
+    """
+    args, kwargs = _parse_kwargs(expr, 1)
+    args, kwargs, prev_id = _extract_prev_id(args, kwargs)
+
+    # Resolve source input
+    if prev_id:
+        source_input = prev_id if isinstance(prev_id, str) else str(prev_id)
+    elif args:
+        source_input = _resolve_input(args[0], ctx, None)
+    else:
+        raise CompileError("scan requires a source input")
+
+    if "rng" in kwargs:
+        rng_val = _resolve_rng_value(kwargs["rng"], ctx)
+        seed = _derive_seed(rng_val)
+    else:
+        seed = kwargs.get("seed", 0)
+        seed = _eval_const_expr(seed, ctx)
+
+    if "step" not in kwargs:
+        raise CompileError("scan requires :step expression")
+    if "emit" not in kwargs:
+        raise CompileError("scan requires :emit expression")
+
+    init_expr = _compile_scan_expr(kwargs.get("init", 0), ctx)
+    step_expr = _compile_scan_expr(kwargs["step"], ctx)
+
+    emit_raw = kwargs["emit"]
+    if isinstance(emit_raw, dict):
+        result = {}
+        for field_name, field_expr in emit_raw.items():
+            field_emit = _compile_scan_expr(field_expr, ctx)
+            config = {
+                "seed": int(seed),
+                "init": init_expr,
+                "step_expr": step_expr,
+                "emit_expr": field_emit,
+            }
+            node_id = ctx.add_node("SCAN", config, inputs=[source_input])
+            result[field_name] = node_id
+        return {"_multi_scan": True, "fields": result}
+
+    emit_expr = _compile_scan_expr(emit_raw, ctx)
+
+    config = {
+        "seed": int(seed),
+        "init": init_expr,
+        "step_expr": step_expr,
+        "emit_expr": emit_expr,
+    }
+
+    return ctx.add_node("SCAN", config, inputs=[source_input])
+
+
+def _compile_blend_multi(expr: List, ctx: CompilerContext) -> str:
+    """Compile (blend-multi :videos [...] :weights [...] :mode M :resize_mode R).
+
+    Produces a single EFFECT node that takes N video inputs and N weight
+    bindings, blending them in one pass via the blend_multi effect.
+    """
+    _, kwargs = _parse_kwargs(expr, 1)
+
+    videos = kwargs.get("videos")
+    weights = kwargs.get("weights")
+    mode = kwargs.get("mode", "alpha")
+    resize_mode = kwargs.get("resize_mode", "fit")
+
+    if not videos or not weights:
+        raise CompileError("blend-multi requires :videos and :weights")
+    if not isinstance(videos, list) or not isinstance(weights, list):
+        raise CompileError("blend-multi :videos and :weights must be lists")
+    if len(videos) != len(weights):
+        raise CompileError(
+            f"blend-multi: videos ({len(videos)}) and weights "
+            f"({len(weights)}) must be same length"
+        )
+    if len(videos) < 2:
+        raise CompileError("blend-multi requires at least 2 videos")
+
+    # Resolve video symbols to node IDs — these become the multi-input list
+    input_ids = []
+    for v in videos:
+        input_ids.append(_resolve_input(v, ctx, None))
+
+    # Process each weight symbol into a binding dict {_binding, source, feature}
+    weight_bindings = []
+    for w in weights:
+        bind_expr = [Symbol("bind"), w, Symbol("values")]
+        weight_bindings.append(_process_value(bind_expr, ctx))
+
+    # Build EFFECT config
+    effects_registry = ctx.registry.get("effects", {})
+    config = {
+        "effect": "blend_multi",
+        "multi_input": True,
+        "weights": weight_bindings,
+        "mode": mode,
+        "resize_mode": resize_mode,
+    }
+
+    # Attach effect path / cid from registry
+    if "blend_multi" in effects_registry:
+        effect_info = effects_registry["blend_multi"]
+        if isinstance(effect_info, dict):
+            if "path" in effect_info:
+                config["effect_path"] = effect_info["path"]
+            if "cid" in effect_info and effect_info["cid"]:
+                config["effect_cid"] = effect_info["cid"]
+
+    # Include effects registry for workers
+    effects_with_cids = {}
+    for name, info in effects_registry.items():
+        if isinstance(info, dict) and info.get("cid"):
+            effects_with_cids[name] = info["cid"]
+    if effects_with_cids:
+        config["effects_registry"] = effects_with_cids
+
+    # Extract analysis refs so workers know which analysis data they need
+    analysis_refs = set()
+    for wb in weight_bindings:
+        _extract_analysis_refs(wb, analysis_refs)
+    if analysis_refs:
+        config["analysis_refs"] = list(analysis_refs)
+
+    return ctx.add_node("EFFECT", config, input_ids)
+
+
+def _compile_deftemplate(expr: List, ctx: CompilerContext) -> None:
+    """Compile (deftemplate NAME (PARAMS...) BODY...).
+
+    Stores the template definition in the registry for later invocation.
+    Returns None (definition only, no nodes).
+    """
+    if len(expr) < 4:
+        raise CompileError("deftemplate requires name, params, and body")
+
+    name = expr[1]
+    if isinstance(name, Symbol):
+        name = name.name
+
+    params = expr[2]
+    if not isinstance(params, list):
+        raise CompileError("deftemplate params must be a list")
+
+    param_names = []
+    for p in params:
+        if isinstance(p, Symbol):
+            param_names.append(p.name)
+        else:
+            raise CompileError(f"deftemplate param must be a symbol, got {p}")
+
+    body_forms = expr[3:]
+
+    ctx.registry["templates"][name] = {
+        "params": param_names,
+        "body": body_forms,
+    }
+    return None
+
+
+def _substitute_template(expr, params_map, local_names, prefix):
+    """Deep walk s-expression tree, substituting params and prefixing locals."""
+    if isinstance(expr, Symbol):
+        if expr.name in params_map:
+            return params_map[expr.name]
+        if expr.name in local_names:
+            return Symbol(prefix + expr.name)
+        return expr
+    if isinstance(expr, list):
+        return [_substitute_template(e, params_map, local_names, prefix) for e in expr]
+    if isinstance(expr, dict):
+        if expr.get("_rng"):
+            return expr  # preserve shared mutable counter
+        return {k: _substitute_template(v, params_map, local_names, prefix) for k, v in expr.items()}
+    return expr  # numbers, strings, keywords, etc.
+
+
+def _compile_template_call(expr: List, ctx: CompilerContext) -> str:
+    """Compile a call to a user-defined template.
+
+    Expands the template body with parameter substitution and local name
+    prefixing, then compiles each resulting form.
+    """
+    name = expr[0].name
+    template = ctx.registry["templates"][name]
+    param_names = template["params"]
+    body_forms = template["body"]
+
+    # Parse keyword args from invocation
+    _, kwargs = _parse_kwargs(expr, 1)
+
+    # Build param -> value map
+    params_map = {}
+    for pname in param_names:
+        # Convert param name to kwarg key (hyphens match keyword names)
+        key = pname
+        if key not in kwargs:
+            raise CompileError(f"Template '{name}' missing parameter :{key}")
+        params_map[pname] = kwargs[key]
+
+    # Generate unique prefix
+    prefix = f"_t{ctx.template_call_count}_"
+    ctx.template_call_count += 1
+
+    # Collect local names: scan body for (def NAME ...) forms
+    local_names = set()
+    for form in body_forms:
+        if isinstance(form, list) and len(form) >= 2:
+            if isinstance(form[0], Symbol) and form[0].name == "def":
+                if isinstance(form[1], Symbol):
+                    local_names.add(form[1].name)
+
+    # Substitute and compile each body form
+    last_node_id = None
+    for form in body_forms:
+        substituted = _substitute_template(form, params_map, local_names, prefix)
+        result = _compile_expr(substituted, ctx)
+        if result is not None:
+            last_node_id = result
+
+    return last_node_id
+
+
+def compile_string(text: str, initial_bindings: Dict[str, Any] = None, recipe_dir: Path = None) -> CompiledRecipe:
     """
     Compile an S-expression recipe string.
 
@@ -1844,6 +2457,7 @@ def compile_string(text: str, initial_bindings: Dict[str, Any] = None) -> Compil
         text: S-expression recipe string
         initial_bindings: Optional dict of name -> value bindings to inject before compilation.
                          These can be referenced as variables in the recipe.
+        recipe_dir: Directory containing the recipe file, for resolving relative paths to effects etc.
     """
     sexp = parse(text)
-    return compile_recipe(sexp, initial_bindings)
+    return compile_recipe(sexp, initial_bindings, recipe_dir=recipe_dir, source_text=text)
